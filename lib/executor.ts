@@ -8,6 +8,7 @@
 import { createServiceSupabase } from "./supabase";
 import * as qbo from "./qbo";
 import * as double from "./double";
+import * as validate from "./qbo-validation";
 
 type SupabaseClient = ReturnType<typeof createServiceSupabase>;
 
@@ -85,6 +86,26 @@ async function markActionFailed(ctx: ExecutionContext, actionId: string, errorMe
     .eq("id", actionId);
 }
 
+/**
+ * Convert a queued action into a `flag` so it surfaces in Lisa's review queue
+ * without being attempted against QBO. Called by pre-flight validation when
+ * we know an action would fail (system account, invalid enum, etc).
+ */
+async function flagAction(ctx: ExecutionContext, action: any, reason: string) {
+  await ctx.supabase
+    .from("coa_actions")
+    .update({
+      action: "flag",
+      flagged_reason: reason,
+      executed: false,
+    })
+    .eq("id", action.id);
+  await logActionResult(ctx, action.id, "preflight_flagged", {
+    name: action.current_name || action.new_name,
+    reason,
+  });
+}
+
 async function getBookkeeperName(ctx: ExecutionContext): Promise<string> {
   const { data } = await ctx.supabase
     .from("users")
@@ -140,8 +161,100 @@ export async function executeJob(jobId: string): Promise<{
   if (!actions) throw new Error("No actions found for job");
 
   try {
+    // ============================================================
+    // STAGE 0: Pre-flight validation
+    // ============================================================
+    // Before touching QBO, validate every action against known QBO rules.
+    // Actions that are guaranteed to fail (system accounts, invalid enums,
+    // rename-to-parent-name) get re-marked as `flag` with a reason, so they
+    // surface in Lisa's review queue instead of polluting the error log.
+    // Recoverable issues (wrong AccountType for known subtype) get auto-corrected.
+    await logProgress(ctx, "stage_start", `Pre-flight validation of ${actions.length} actions`,
+      { stage: "preflight", total: actions.length });
+
+    // Fetch live QBO state once for name-collision checks.
+    const liveAccounts = await qbo.fetchAllAccounts(ctx.realmId, ctx.accessToken);
+    const liveById = new Map(liveAccounts.map((a) => [a.Id, a]));
+
+    let flaggedCount = 0;
+    let correctedCount = 0;
+
+    for (const a of actions as any[]) {
+      // -- Rule 1: System accounts cannot be modified via API.
+      // If the action targets a known QBO system account (Uncategorized, etc),
+      // flag it. Never attempt to rename/inactivate these.
+      if (a.action !== "create" && a.current_name && validate.isSystemAccount(a.current_name)) {
+        await flagAction(ctx, a, `System-protected QBO account "${a.current_name}" cannot be modified via API. Skipping.`);
+        flaggedCount++;
+        continue;
+      }
+
+      // -- Rule 2: Type/Subtype enum validity (creates only — renames don't change type)
+      if (a.action === "create") {
+        const v = validate.validateTypeSubtype(a.new_type, a.new_subtype);
+        if (!v.ok) {
+          const reason = v.suggestion
+            ? `${v.reason}. Did you mean "${v.suggestion}"? Set new_subtype manually and retry.`
+            : `${v.reason}. Account cannot be created.`;
+          await flagAction(ctx, a, reason);
+          flaggedCount++;
+          continue;
+        }
+        if (v.correctedType && v.correctedType !== a.new_type) {
+          // Auto-correct the AccountType to match the subtype's required type
+          await ctx.supabase.from("coa_actions")
+            .update({ new_type: v.correctedType })
+            .eq("id", a.id);
+          a.new_type = v.correctedType;
+          correctedCount++;
+          await logActionResult(ctx, a.id, "preflight_corrected", {
+            field: "new_type",
+            value: v.correctedType,
+            reason: `Auto-corrected to match subtype "${a.new_subtype}"`,
+          });
+        }
+      }
+
+      // -- Rule 3: Rename target equals current parent's name (merge, not rename)
+      if (a.action === "rename" && a.qbo_account_id && a.new_name) {
+        const current = liveById.get(a.qbo_account_id);
+        if (current?.SubAccount && current.ParentRef?.value) {
+          const parent = liveById.get(current.ParentRef.value);
+          if (parent && parent.Name.trim().toLowerCase() === a.new_name.trim().toLowerCase()) {
+            await flagAction(ctx, a,
+              `Rename target "${a.new_name}" equals the parent account's name. This looks like a merge, not a rename. Review manually.`
+            );
+            flaggedCount++;
+            continue;
+          }
+        }
+      }
+
+      // -- Rule 4: Rename would cause a name collision
+      if (a.action === "rename" && a.qbo_account_id && a.new_name) {
+        const current = liveById.get(a.qbo_account_id);
+        const parentId = current?.ParentRef?.value || null;
+        if (validate.wouldCollide(a.new_name, liveAccounts, a.qbo_account_id, parentId)) {
+          await flagAction(ctx, a,
+            `Rename target "${a.new_name}" already exists in QBO at the same parent level. Pick a different name or use merge.`
+          );
+          flaggedCount++;
+          continue;
+        }
+      }
+    }
+
+    await logProgress(ctx, "stage_complete",
+      `Pre-flight done. ${flaggedCount} flagged, ${correctedCount} auto-corrected.`,
+      { stage: "preflight", flagged: flaggedCount, corrected: correctedCount });
+
+    // Re-fetch actions so subsequent stages skip the just-flagged ones
+    const { data: validatedActions } = await ctx.supabase
+      .from("coa_actions").select("*").eq("job_id", jobId).order("sort_order");
+    const liveActions = (validatedActions || actions) as any[];
+
     // STAGE 1: Create parents
-    const parentCreations = actions.filter((a) => a.action === "create" && !a.new_parent_name);
+    const parentCreations = liveActions.filter((a) => a.action === "create" && !a.new_parent_name);
     const parentIdMap = new Map<string, string>();
 
     if (parentCreations.length > 0) {
@@ -172,7 +285,7 @@ export async function executeJob(jobId: string): Promise<{
     // STAGE 1.5: Auto-create any missing parent accounts referenced by child creations.
     // Claude's analysis sometimes assumes parents like "Vehicle Expenses" exist when they don't.
     // We look up the parent's QBO type from the master COA and create it on the fly.
-    const childCreations = actions.filter((a) => a.action === "create" && a.new_parent_name);
+    const childCreations = liveActions.filter((a) => a.action === "create" && a.new_parent_name);
     if (childCreations.length > 0) {
       const allAccountsCache = await qbo.fetchAllAccounts(ctx.realmId, ctx.accessToken);
       const existingNames = new Set(allAccountsCache.map((a) => a.Name));
@@ -285,7 +398,7 @@ export async function executeJob(jobId: string): Promise<{
     }
 
     // STAGE 3: Rename
-    const renames = actions.filter((a) => a.action === "rename");
+    const renames = liveActions.filter((a) => a.action === "rename");
 
     if (renames.length > 0) {
       await logProgress(ctx, "stage_start", `Renaming ${renames.length} accounts`,
@@ -328,7 +441,7 @@ export async function executeJob(jobId: string): Promise<{
     }
 
     // STAGE 4: Inactivate
-    const deletions = actions.filter((a) => a.action === "delete");
+    const deletions = liveActions.filter((a) => a.action === "delete");
 
     if (deletions.length > 0) {
       await logProgress(ctx, "stage_start", `Inactivating ${deletions.length} accounts`,
