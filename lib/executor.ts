@@ -176,6 +176,13 @@ export async function executeJob(jobId: string): Promise<{
     const liveAccounts = await qbo.fetchAllAccounts(ctx.realmId, ctx.accessToken);
     const liveById = new Map(liveAccounts.map((a) => [a.Id, a]));
 
+    // Fetch transaction counts per account. Critical for Rule 5: QBO blocks
+    // inactivation of accounts with any historical transactions, even if the
+    // current balance is zero. CurrentBalance alone is not enough.
+    const txCounts = await qbo.fetchTransactionCountsForAllAccounts(
+      ctx.realmId, ctx.accessToken
+    );
+
     let flaggedCount = 0;
     let correctedCount = 0;
 
@@ -243,19 +250,37 @@ export async function executeJob(jobId: string): Promise<{
         }
       }
 
-      // -- Rule 5: Inactivate of an account with transactions / non-zero balance.
-      // QBO blocks API inactivation of accounts that have transaction history
-      // creating a non-zero balance. The web UI allows it with a warning popup;
-      // the API returns a generic 2010 error. Detect proactively from
-      // CurrentBalance + CurrentBalanceWithSubAccounts and flag for manual review.
+      // -- Rule 5: Inactivate of an account with transaction history or non-zero balance.
+      // QBO blocks API inactivation of accounts that:
+      //   (a) have a non-zero current balance, OR
+      //   (b) have any historical transactions (even if balance now nets to zero), OR
+      //   (c) have active sub-accounts
+      // The web UI lets users force-deactivate these with a warning popup; the API
+      // does not. Detect proactively and flag — Lisa handles these manually in QBO.
       if (a.action === "delete" && a.qbo_account_id) {
         const current: any = liveById.get(a.qbo_account_id);
         if (current) {
           const balance = Number(current.CurrentBalance ?? 0);
           const balanceWithSubs = Number(current.CurrentBalanceWithSubAccounts ?? 0);
-          if (balance !== 0 || balanceWithSubs !== 0) {
+          const txCount = txCounts.get(a.qbo_account_id) ?? 0;
+          // Active sub-accounts check
+          const hasActiveChildren = liveAccounts.some(
+            (other: any) =>
+              other.ParentRef?.value === a.qbo_account_id &&
+              other.Active !== false
+          );
+
+          if (balance !== 0 || balanceWithSubs !== 0 || txCount > 0 || hasActiveChildren) {
+            const reasons: string[] = [];
+            if (balance !== 0) reasons.push(`current balance ${balance.toFixed(2)}`);
+            if (balanceWithSubs !== 0 && balanceWithSubs !== balance) {
+              reasons.push(`balance-with-subs ${balanceWithSubs.toFixed(2)}`);
+            }
+            if (txCount > 0) reasons.push(`${txCount} historical transactions`);
+            if (hasActiveChildren) reasons.push(`active sub-accounts`);
+
             await flagAction(ctx, a,
-              `Account "${current.Name}" has a non-zero balance (${balance.toFixed(2)} direct, ${balanceWithSubs.toFixed(2)} with sub-accounts). QBO blocks API inactivation of accounts with transaction history — Lisa must zero the balance or reclassify transactions first, then inactivate via QBO UI.`
+              `Cannot inactivate "${current.Name}" via API: ${reasons.join(", ")}. QBO requires manual handling for accounts with activity — please reclassify transactions and zero the balance, then inactivate via QBO UI.`
             );
             flaggedCount++;
             continue;
