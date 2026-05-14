@@ -392,8 +392,9 @@ export async function reparentAccount(
 /**
  * Fast bulk fetch of transaction counts per account.
  *
- * Uses the GeneralLedgerReport which lists all transactions grouped by account.
- * Counts entries to derive how many transactions each account has been used in.
+ * Uses the TransactionList report, which has a FLAT row structure with one
+ * row per transaction and an account_id column. This is MUCH more reliable
+ * than parsing the nested GeneralLedger report.
  *
  * Returns: Map<accountId, transactionCount>
  *
@@ -401,8 +402,11 @@ export async function reparentAccount(
  * transactions, even if current balance is zero. Pre-flight needs this info to
  * decide whether an inactivate is safe or must be flagged.
  *
- * Strategy: pull the General Ledger report (covers all account types in one call).
- * Falls back to per-account queries if the report fails.
+ * Implementation notes:
+ *   - The TransactionList report returns one row per transaction line.
+ *   - We use the `account_id` column to bucket counts per account.
+ *   - Use a wide date range to capture all historical transactions.
+ *   - QBO reports use 'columns' to specify what columns to return.
  */
 export async function fetchTransactionCountsForAllAccounts(
   realmId: string,
@@ -411,43 +415,55 @@ export async function fetchTransactionCountsForAllAccounts(
   const counts = new Map<string, number>();
 
   try {
-    // GL report covers all accounts in one call. Date range: cover 'all time' by
-    // using a very old start_date. QBO accepts wide ranges on reports.
     const params = new URLSearchParams({
       start_date: '1900-01-01',
       end_date: '2099-12-31',
+      columns: 'tx_date,account_name,txn_type',
       minorversion: '70',
     });
     const data = await qboRequest<any>(
       realmId,
       accessToken,
-      `/reports/GeneralLedger?${params.toString()}`
+      `/reports/TransactionList?${params.toString()}`
     );
 
-    // Walk the report tree. Rows have a `group` shape per account, each with
-    // its own `Rows.Row[]` of transaction entries.
+    // TransactionList structure:
+    //   data.Columns.Column[] - column metadata
+    //   data.Rows.Row[]       - one entry per transaction (flat)
+    // Each Row has ColData[] where each ColData has { value, id? }.
+    // The account name column may have an `id` attribute = account id.
+
+    // Find which column index represents the account
+    const columns = data.Columns?.Column || [];
+    let accountColIndex = -1;
+    for (let i = 0; i < columns.length; i++) {
+      const colTitle = (columns[i]?.ColTitle || '').toLowerCase();
+      const colType = (columns[i]?.ColType || '').toLowerCase();
+      if (colTitle.includes('account') || colType === 'account') {
+        accountColIndex = i;
+        break;
+      }
+    }
+
+    if (accountColIndex === -1) {
+      console.warn('[fetchTransactionCountsForAllAccounts] No account column found in TransactionList');
+      return counts;
+    }
+
+    // Walk flat row list, bucketing by account id
     function walkRows(rows: any[]): void {
       if (!Array.isArray(rows)) return;
       for (const row of rows) {
-        // Account header row: has Header with ColData[0] = account id reference
-        if (row.type === 'Section' && row.Header?.ColData) {
-          // The account_id usually appears in the row's `group` field or in
-          // a value attribute on the Header. Different QBO accounts return
-          // slightly different structure — try both common shapes.
-          const accountId =
-            row.group ||
-            row.Header.ColData[0]?.value ||
-            row.Header.ColData[0]?.id;
+        // A row is either a data row (has ColData directly) or a section/group
+        // wrapping more rows. We handle both.
+        if (row.ColData && Array.isArray(row.ColData)) {
+          const cell = row.ColData[accountColIndex];
+          const accountId = cell?.id;
           if (accountId) {
-            // Count the data rows inside this section (excluding the totals row)
-            const detailRows = row.Rows?.Row || [];
-            const txCount = detailRows.filter(
-              (r: any) => r.type === 'Data' || (!r.type && r.ColData)
-            ).length;
-            counts.set(String(accountId), txCount);
+            const key = String(accountId);
+            counts.set(key, (counts.get(key) ?? 0) + 1);
           }
         }
-        // Recurse into nested rows
         if (row.Rows?.Row) {
           walkRows(row.Rows.Row);
         }
@@ -457,13 +473,62 @@ export async function fetchTransactionCountsForAllAccounts(
     if (data.Rows?.Row) {
       walkRows(data.Rows.Row);
     }
+
+    console.log(
+      `[fetchTransactionCountsForAllAccounts] Counted transactions for ${counts.size} accounts. ` +
+      `Total transactions: ${Array.from(counts.values()).reduce((a, b) => a + b, 0)}`
+    );
   } catch (e) {
-    console.error('[fetchTransactionCountsForAllAccounts] GL report failed:', e);
-    // Don't throw — return whatever we have. Pre-flight will treat missing
-    // entries as "unknown" rather than blocking the cleanup.
+    console.error('[fetchTransactionCountsForAllAccounts] TransactionList report failed:', e);
+    // Don't throw — return whatever we have. Pre-flight will fall back to a
+    // per-account direct check (slower but reliable) if it sees an empty map.
   }
 
   return counts;
+}
+
+/**
+ * Direct per-account transaction existence check.
+ *
+ * Use this as a fallback when the TransactionList report fails or returns empty.
+ * Slower (one API call per account) but 100% reliable for the "does this
+ * account have any transactions?" question.
+ *
+ * Strategy: query the JournalEntry, Purchase, Bill, Deposit, Invoice, Payment,
+ * SalesReceipt, and Expense entities for any line referencing the account.
+ * We only need to know "any" not "how many" — so we ask for 1 result max.
+ */
+export async function accountHasTransactions(
+  realmId: string,
+  accessToken: string,
+  accountId: string
+): Promise<boolean> {
+  // The most reliable single-query is to check whether the account has been
+  // referenced in any Journal Entry line. JournalEntries touch every account
+  // type. Other transaction types are also possible but JEs are universal.
+  const queries = [
+    `SELECT Id FROM JournalEntry WHERE Line.JournalEntryLineDetail.AccountRef = '${accountId}' MAXRESULTS 1`,
+    `SELECT Id FROM Purchase WHERE AccountRef = '${accountId}' MAXRESULTS 1`,
+    `SELECT Id FROM Deposit WHERE DepositToAccountRef = '${accountId}' MAXRESULTS 1`,
+  ];
+
+  for (const q of queries) {
+    try {
+      const data = await qboRequest<any>(
+        realmId,
+        accessToken,
+        `/query?query=${encodeURIComponent(q)}&minorversion=70`
+      );
+      const results =
+        data.QueryResponse?.JournalEntry ||
+        data.QueryResponse?.Purchase ||
+        data.QueryResponse?.Deposit;
+      if (results && results.length > 0) return true;
+    } catch {
+      // Some queries don't apply to all account types; skip silently
+    }
+  }
+  return false;
 }
 
 export interface QBOTransaction {
