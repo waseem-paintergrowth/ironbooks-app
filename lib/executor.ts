@@ -242,6 +242,26 @@ export async function executeJob(jobId: string): Promise<{
           continue;
         }
       }
+
+      // -- Rule 5: Inactivate of an account with transactions / non-zero balance.
+      // QBO blocks API inactivation of accounts that have transaction history
+      // creating a non-zero balance. The web UI allows it with a warning popup;
+      // the API returns a generic 2010 error. Detect proactively from
+      // CurrentBalance + CurrentBalanceWithSubAccounts and flag for manual review.
+      if (a.action === "delete" && a.qbo_account_id) {
+        const current: any = liveById.get(a.qbo_account_id);
+        if (current) {
+          const balance = Number(current.CurrentBalance ?? 0);
+          const balanceWithSubs = Number(current.CurrentBalanceWithSubAccounts ?? 0);
+          if (balance !== 0 || balanceWithSubs !== 0) {
+            await flagAction(ctx, a,
+              `Account "${current.Name}" has a non-zero balance (${balance.toFixed(2)} direct, ${balanceWithSubs.toFixed(2)} with sub-accounts). QBO blocks API inactivation of accounts with transaction history — Lisa must zero the balance or reclassify transactions first, then inactivate via QBO UI.`
+            );
+            flaggedCount++;
+            continue;
+          }
+        }
+      }
     }
 
     await logProgress(ctx, "stage_complete",
