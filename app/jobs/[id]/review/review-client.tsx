@@ -63,15 +63,29 @@ export function ReviewClient({
     }
     setExecuting(true);
 
-    const res = await fetch(`/api/jobs/${jobId}/execute`, { method: "POST" });
-    const result = await res.json();
+    let res: Response;
+    let result: any = {};
+    try {
+      res = await fetch(`/api/jobs/${jobId}/execute`, { method: "POST" });
+      result = await res.json().catch(() => ({}));
+    } catch (err: any) {
+      setExecuting(false);
+      alert(`Network error while starting execution: ${err?.message || err}`);
+      return;
+    }
 
     setExecuting(false);
 
-    if (result.success) {
+    // Execute endpoint returns { started: true, job_id } when kicked off successfully,
+    // or { error: "..." } with non-2xx status on validation failures.
+    if (res.ok && (result.started || result.message)) {
       router.push(`/jobs/${jobId}/execute`);
     } else {
-      alert(`Execution failed: ${result.error || result.errors?.join(", ")}`);
+      const msg =
+        result.error ||
+        (Array.isArray(result.errors) ? result.errors.join(", ") : null) ||
+        `HTTP ${res.status} ${res.statusText}`;
+      alert(`Could not start execution: ${msg}`);
     }
   }
 
