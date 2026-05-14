@@ -1,5 +1,5 @@
 import { createServerSupabase, createServiceSupabase } from "@/lib/supabase";
-import { fetchAllAccounts, getValidToken } from "@/lib/qbo";
+import { fetchAllAccounts, getValidToken, fetchTransactionCountsForAllAccounts } from "@/lib/qbo";
 import { analyzeCOA, type MasterCOAEntry } from "@/lib/claude";
 import { NextResponse } from "next/server";
 
@@ -52,6 +52,20 @@ export async function POST(
     // 3. Fetch QBO COA
     const qboAccounts = await fetchAllAccounts(clientLink.qbo_realm_id, accessToken);
 
+    // 3a. Fetch transaction counts for all accounts.
+    // CRITICAL for production: Claude must know which accounts have transactions
+    // so it suggests FLAG instead of DELETE. Otherwise it suggests deletes that
+    // QBO will reject at runtime.
+    const txCounts = await fetchTransactionCountsForAllAccounts(
+      clientLink.qbo_realm_id, accessToken
+    );
+
+    // Decorate accounts with transaction_count so Claude sees it in the prompt
+    const accountsWithTxCounts = qboAccounts.map((a: any) => ({
+      ...a,
+      transaction_count: txCounts.get(a.Id) ?? 0,
+    }));
+
     // 4. Load master COA for jurisdiction
     const { data: masterRows } = await service
       .from("master_coa")
@@ -76,7 +90,7 @@ export async function POST(
       clientName: clientLink.client_name,
       jurisdiction: clientLink.jurisdiction,
       stateProvince: clientLink.state_province || "",
-      clientAccounts: qboAccounts,
+      clientAccounts: accountsWithTxCounts,
       masterCOA,
     });
 
@@ -106,6 +120,7 @@ export async function POST(
       ai_reasoning: s.reasoning,
       ai_suggested_target: s.target_master_account || null,
       flagged_reason: s.flag_reason || null,
+      transaction_count: s.qbo_account_id ? (txCounts.get(s.qbo_account_id) ?? 0) : 0,
       sort_order: idx,
     }));
 
