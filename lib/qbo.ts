@@ -253,6 +253,10 @@ export async function createAccount(
 
 /**
  * Rename an existing account (preserves history + transactions).
+ *
+ * IMPORTANT: For sub-accounts, you must also pass the current account object
+ * (or its ParentRef + SubAccount + AccountType) so QBO preserves the parent
+ * relationship during sparse update. Otherwise QBO returns 2010.
  */
 export async function renameAccount(
   realmId: string,
@@ -260,7 +264,12 @@ export async function renameAccount(
   accountId: string,
   syncToken: string,
   newName: string,
-  options?: { newSubType?: string; taxCodeRef?: string }
+  options?: {
+    newSubType?: string;
+    taxCodeRef?: string;
+    /** Pass the current full account from QBO to preserve sub-account/parent state */
+    currentAccount?: QBOAccount;
+  }
 ): Promise<QBOAccount> {
   const body: any = {
     Id: accountId,
@@ -268,6 +277,18 @@ export async function renameAccount(
     sparse: true,
     Name: newName,
   };
+
+  // Preserve sub-account + parent relationship if applicable.
+  // QBO 2010 errors on rename of sub-accounts when these fields are missing.
+  if (options?.currentAccount) {
+    const cur = options.currentAccount;
+    if (cur.AccountType) body.AccountType = cur.AccountType;
+    if (cur.AccountSubType) body.AccountSubType = cur.AccountSubType;
+    if (cur.SubAccount) {
+      body.SubAccount = true;
+      if (cur.ParentRef?.value) body.ParentRef = { value: cur.ParentRef.value };
+    }
+  }
 
   if (options?.newSubType) body.AccountSubType = options.newSubType;
   if (options?.taxCodeRef) body.TaxCodeRef = { value: options.taxCodeRef };
@@ -284,25 +305,43 @@ export async function renameAccount(
 
 /**
  * Inactivate an account (QBO doesn't allow true deletion if there's history).
+ *
+ * IMPORTANT: For sub-accounts, you must pass the current account so we preserve
+ * Type/SubAccount/ParentRef. Otherwise QBO 2010 errors.
  */
 export async function inactivateAccount(
   realmId: string,
   accessToken: string,
   accountId: string,
-  syncToken: string
+  syncToken: string,
+  currentAccount?: QBOAccount
 ): Promise<QBOAccount> {
+  const body: any = {
+    Id: accountId,
+    SyncToken: syncToken,
+    sparse: true,
+    Active: false,
+  };
+
+  if (currentAccount) {
+    if (currentAccount.AccountType) body.AccountType = currentAccount.AccountType;
+    if (currentAccount.AccountSubType) body.AccountSubType = currentAccount.AccountSubType;
+    if (currentAccount.SubAccount) {
+      body.SubAccount = true;
+      if (currentAccount.ParentRef?.value) {
+        body.ParentRef = { value: currentAccount.ParentRef.value };
+      }
+    }
+    if (currentAccount.Name) body.Name = currentAccount.Name;
+  }
+
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
     '/account?minorversion=70',
     {
       method: 'POST',
-      body: JSON.stringify({
-        Id: accountId,
-        SyncToken: syncToken,
-        sparse: true,
-        Active: false,
-      }),
+      body: JSON.stringify(body),
     }
   );
 
