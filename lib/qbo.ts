@@ -265,6 +265,7 @@ export async function renameAccount(
   const body: any = {
     Id: accountId,
     SyncToken: syncToken,
+    sparse: true,
     Name: newName,
   };
 
@@ -274,7 +275,7 @@ export async function renameAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?operation=update&sparse=true&minorversion=70',
+    '/account?minorversion=70',
     { method: 'POST', body: JSON.stringify(body) }
   );
 
@@ -293,12 +294,13 @@ export async function inactivateAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?operation=update&sparse=true&minorversion=70',
+    '/account?minorversion=70',
     {
       method: 'POST',
       body: JSON.stringify({
         Id: accountId,
         SyncToken: syncToken,
+        sparse: true,
         Active: false,
       }),
     }
@@ -320,12 +322,13 @@ export async function reparentAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?operation=update&sparse=true&minorversion=70',
+    '/account?minorversion=70',
     {
       method: 'POST',
       body: JSON.stringify({
         Id: accountId,
         SyncToken: syncToken,
+        sparse: true,
         ParentRef: { value: newParentId },
         SubAccount: true,
       }),
