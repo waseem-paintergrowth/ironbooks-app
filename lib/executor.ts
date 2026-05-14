@@ -262,7 +262,25 @@ export async function executeJob(jobId: string): Promise<{
         if (current) {
           const balance = Number(current.CurrentBalance ?? 0);
           const balanceWithSubs = Number(current.CurrentBalanceWithSubAccounts ?? 0);
-          const txCount = txCounts.get(a.qbo_account_id) ?? 0;
+          let txCount = txCounts.get(a.qbo_account_id) ?? 0;
+
+          // FALLBACK: If bulk tx count is 0 but the account might still have
+          // transactions (TransactionList report has known reliability issues
+          // on some sandbox/edge accounts), verify with a direct per-account
+          // query before letting the delete through.
+          // This is slower (1 extra API call per delete candidate) but is the
+          // only 100% reliable way to catch the "has transactions" case.
+          let hasTxFromDirectCheck = false;
+          if (txCount === 0 && balance === 0 && balanceWithSubs === 0) {
+            try {
+              hasTxFromDirectCheck = await qbo.accountHasTransactions(
+                ctx.realmId, ctx.accessToken, a.qbo_account_id
+              );
+            } catch {
+              // ignore — proceed with txCount we already have
+            }
+          }
+
           // Active sub-accounts check
           const hasActiveChildren = liveAccounts.some(
             (other: any) =>
@@ -270,13 +288,20 @@ export async function executeJob(jobId: string): Promise<{
               other.Active !== false
           );
 
-          if (balance !== 0 || balanceWithSubs !== 0 || txCount > 0 || hasActiveChildren) {
+          if (
+            balance !== 0 ||
+            balanceWithSubs !== 0 ||
+            txCount > 0 ||
+            hasTxFromDirectCheck ||
+            hasActiveChildren
+          ) {
             const reasons: string[] = [];
             if (balance !== 0) reasons.push(`current balance ${balance.toFixed(2)}`);
             if (balanceWithSubs !== 0 && balanceWithSubs !== balance) {
               reasons.push(`balance-with-subs ${balanceWithSubs.toFixed(2)}`);
             }
             if (txCount > 0) reasons.push(`${txCount} historical transactions`);
+            else if (hasTxFromDirectCheck) reasons.push(`has historical transactions (verified directly)`);
             if (hasActiveChildren) reasons.push(`active sub-accounts`);
 
             await flagAction(ctx, a,
