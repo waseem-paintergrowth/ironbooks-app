@@ -1,0 +1,791 @@
+"use client";
+
+import { useState, useMemo } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+import {
+  Search,
+  MapPin,
+  ExternalLink,
+  ChevronDown,
+  Zap,
+  Flag,
+  FileCheck,
+  Clock,
+  AlertCircle,
+  CheckCircle2,
+  Pause,
+  CircleSlash,
+  Sparkles,
+  User as UserIcon,
+  Loader2,
+  Building2,
+} from "lucide-react";
+
+interface ClientRow {
+  id: string;
+  client_name: string;
+  client_email: string | null;
+  jurisdiction: "US" | "CA";
+  state_province: string | null;
+  status: "onboarding" | "active" | "behind" | "paused" | "churned";
+  is_active: boolean;
+  qbo_realm_id: string;
+  double_client_id: string;
+  double_client_name: string | null;
+  qbo_token_expires_at: string | null;
+  created_at: string;
+  assigned_bookkeeper_id: string | null;
+  assigned_bookkeeper_name: string | null;
+  assigned_bookkeeper_avatar: string | null;
+  total_cleanups: number;
+  completed_cleanups: number;
+  active_cleanups: number;
+  flagged_cleanups: number;
+  active_rules: number;
+  last_cleanup_at: string | null;
+}
+
+interface Bookkeeper {
+  id: string;
+  full_name: string;
+  avatar_url: string | null;
+}
+
+const STATUS_CONFIG: Record<string, { icon: any; color: string; bg: string; label: string }> = {
+  onboarding: { icon: Sparkles, color: "#7C3AED", bg: "#EDE9FE", label: "Onboarding" },
+  active: { icon: CheckCircle2, color: "#10B981", bg: "#D1FAE5", label: "Active" },
+  behind: { icon: AlertCircle, color: "#DC2626", bg: "#FEE2E2", label: "Behind" },
+  paused: { icon: Pause, color: "#F59E0B", bg: "#FEF3C7", label: "Paused" },
+  churned: { icon: CircleSlash, color: "#94A3B8", bg: "#F1F5F9", label: "Churned" },
+};
+
+export function ClientsList({
+  initialClients,
+  bookkeepers,
+  currentUserId,
+  canEdit,
+}: {
+  initialClients: ClientRow[];
+  bookkeepers: Bookkeeper[];
+  currentUserId: string;
+  canEdit: boolean;
+}) {
+  const router = useRouter();
+  const [clients, setClients] = useState(initialClients);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string>("all_active");
+  const [assignmentFilter, setAssignmentFilter] = useState<string>("all");
+  const [jurisdictionFilter, setJurisdictionFilter] = useState<string>("all");
+  const [view, setView] = useState<"grid" | "table">("table");
+
+  // Filters
+  const filtered = useMemo(() => {
+    let r = clients;
+
+    if (statusFilter === "all_active") {
+      r = r.filter((c) => c.is_active && c.status !== "churned");
+    } else if (statusFilter === "all") {
+      // no filter
+    } else if (statusFilter === "inactive") {
+      r = r.filter((c) => !c.is_active || c.status === "churned");
+    } else {
+      r = r.filter((c) => c.status === statusFilter && c.is_active);
+    }
+
+    if (assignmentFilter === "me") {
+      r = r.filter((c) => c.assigned_bookkeeper_id === currentUserId);
+    } else if (assignmentFilter === "unassigned") {
+      r = r.filter((c) => !c.assigned_bookkeeper_id);
+    } else if (assignmentFilter !== "all") {
+      r = r.filter((c) => c.assigned_bookkeeper_id === assignmentFilter);
+    }
+
+    if (jurisdictionFilter !== "all") {
+      r = r.filter((c) => c.jurisdiction === jurisdictionFilter);
+    }
+
+    if (search) {
+      const s = search.toLowerCase();
+      r = r.filter(
+        (c) =>
+          c.client_name.toLowerCase().includes(s) ||
+          c.client_email?.toLowerCase().includes(s) ||
+          c.state_province?.toLowerCase().includes(s)
+      );
+    }
+
+    return r;
+  }, [clients, search, statusFilter, assignmentFilter, jurisdictionFilter, currentUserId]);
+
+  // Counts for filter pills
+  const statusCounts = useMemo(() => {
+    const active = clients.filter((c) => c.is_active);
+    return {
+      all_active: active.filter((c) => c.status !== "churned").length,
+      onboarding: active.filter((c) => c.status === "onboarding").length,
+      active: active.filter((c) => c.status === "active").length,
+      behind: active.filter((c) => c.status === "behind").length,
+      paused: active.filter((c) => c.status === "paused").length,
+      flagged: clients.filter((c) => c.flagged_cleanups > 0).length,
+    };
+  }, [clients]);
+
+  async function updateClient(id: string, updates: Partial<ClientRow>) {
+    // Optimistic
+    setClients((prev) =>
+      prev.map((c) =>
+        c.id === id
+          ? {
+              ...c,
+              ...updates,
+              assigned_bookkeeper_name:
+                updates.assigned_bookkeeper_id !== undefined
+                  ? bookkeepers.find((b) => b.id === updates.assigned_bookkeeper_id)?.full_name || null
+                  : c.assigned_bookkeeper_name,
+            }
+          : c
+      )
+    );
+
+    const res = await fetch(`/api/clients/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(updates),
+    });
+
+    if (!res.ok) {
+      const { error } = await res.json();
+      alert(`Update failed: ${error}`);
+      // Roll back
+      setClients(initialClients);
+    }
+    router.refresh();
+  }
+
+  return (
+    <div>
+      {/* Status filter pills */}
+      <div className="flex items-center gap-2 mb-4 overflow-x-auto pb-1">
+        <FilterPill
+          label="My Clients"
+          icon={UserIcon}
+          active={assignmentFilter === "me"}
+          onClick={() => setAssignmentFilter(assignmentFilter === "me" ? "all" : "me")}
+        />
+        <div className="w-px h-6 bg-gray-200 mx-1" />
+        <StatusPill
+          label="All Active"
+          count={statusCounts.all_active}
+          active={statusFilter === "all_active"}
+          onClick={() => setStatusFilter("all_active")}
+        />
+        <StatusPill
+          label="Onboarding"
+          count={statusCounts.onboarding}
+          active={statusFilter === "onboarding"}
+          onClick={() => setStatusFilter("onboarding")}
+          color="#7C3AED"
+        />
+        <StatusPill
+          label="Active"
+          count={statusCounts.active}
+          active={statusFilter === "active"}
+          onClick={() => setStatusFilter("active")}
+          color="#10B981"
+        />
+        <StatusPill
+          label="Behind"
+          count={statusCounts.behind}
+          active={statusFilter === "behind"}
+          onClick={() => setStatusFilter("behind")}
+          color="#DC2626"
+        />
+        <StatusPill
+          label="Paused"
+          count={statusCounts.paused}
+          active={statusFilter === "paused"}
+          onClick={() => setStatusFilter("paused")}
+          color="#F59E0B"
+        />
+        {statusCounts.flagged > 0 && (
+          <>
+            <div className="w-px h-6 bg-gray-200 mx-1" />
+            <StatusPill
+              label="Flagged"
+              count={statusCounts.flagged}
+              active={false}
+              onClick={() => {}}
+              color="#F59E0B"
+              icon={Flag}
+            />
+          </>
+        )}
+      </div>
+
+      {/* Search + secondary filters */}
+      <div className="rounded-xl bg-white border border-gray-200 mb-4">
+        <div className="flex items-center gap-3 px-4 py-3">
+          <div className="flex items-center gap-2 flex-1">
+            <Search size={16} className="text-ink-light" />
+            <input
+              type="text"
+              placeholder="Search by name, email, or state..."
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              className="flex-1 px-2 py-1.5 text-sm outline-none text-navy"
+            />
+          </div>
+
+          <select
+            value={assignmentFilter}
+            onChange={(e) => setAssignmentFilter(e.target.value)}
+            className="px-3 py-1.5 border border-gray-200 rounded-md text-xs text-navy bg-white"
+          >
+            <option value="all">All bookkeepers</option>
+            <option value="me">My clients</option>
+            <option value="unassigned">Unassigned</option>
+            <option disabled>──────────</option>
+            {bookkeepers.map((b) => (
+              <option key={b.id} value={b.id}>{b.full_name}</option>
+            ))}
+          </select>
+
+          <select
+            value={jurisdictionFilter}
+            onChange={(e) => setJurisdictionFilter(e.target.value)}
+            className="px-3 py-1.5 border border-gray-200 rounded-md text-xs text-navy bg-white"
+          >
+            <option value="all">All jurisdictions</option>
+            <option value="US">🇺🇸 United States</option>
+            <option value="CA">🇨🇦 Canada</option>
+          </select>
+
+          <div className="flex border border-gray-200 rounded-md overflow-hidden">
+            <button
+              onClick={() => setView("table")}
+              className={`px-3 py-1.5 text-xs font-semibold ${
+                view === "table" ? "bg-navy text-white" : "bg-white text-ink-slate hover:bg-gray-50"
+              }`}
+            >
+              Table
+            </button>
+            <button
+              onClick={() => setView("grid")}
+              className={`px-3 py-1.5 text-xs font-semibold ${
+                view === "grid" ? "bg-navy text-white" : "bg-white text-ink-slate hover:bg-gray-50"
+              }`}
+            >
+              Grid
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div className="text-xs text-ink-slate mb-3">
+        {filtered.length} of {clients.length} clients
+      </div>
+
+      {/* Empty state */}
+      {filtered.length === 0 && (
+        <div className="rounded-xl bg-white border border-gray-200 py-16 px-8 text-center">
+          <Building2 size={32} className="text-ink-light mx-auto mb-3" />
+          <h3 className="text-base font-bold text-navy mb-1">No clients match your filters</h3>
+          <p className="text-sm text-ink-slate">Try adjusting the filters above, or connect a new client.</p>
+        </div>
+      )}
+
+      {/* Table view */}
+      {filtered.length > 0 && view === "table" && (
+        <div className="rounded-xl overflow-hidden bg-white border border-gray-200">
+          <div
+            className="grid items-center px-5 py-3 text-xs font-bold uppercase tracking-wider bg-gray-50 text-ink-slate border-b border-gray-200"
+            style={{ gridTemplateColumns: "1.6fr 0.9fr 1.2fr 1fr 0.85fr 0.9fr 1.1fr 0.4fr" }}
+          >
+            <div>Client</div>
+            <div>Status</div>
+            <div>Double</div>
+            <div>Assigned</div>
+            <div>Last Cleanup</div>
+            <div>Stats</div>
+            <div>Quick Actions</div>
+            <div></div>
+          </div>
+
+          {filtered.map((client) => (
+            <ClientRow
+              key={client.id}
+              client={client}
+              bookkeepers={bookkeepers}
+              canEdit={canEdit}
+              onUpdate={(updates) => updateClient(client.id, updates)}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Grid view */}
+      {filtered.length > 0 && view === "grid" && (
+        <div className="grid grid-cols-3 gap-4">
+          {filtered.map((client) => (
+            <ClientCard
+              key={client.id}
+              client={client}
+              bookkeepers={bookkeepers}
+              canEdit={canEdit}
+              onUpdate={(updates) => updateClient(client.id, updates)}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FilterPill({
+  label,
+  icon: Icon,
+  active,
+  onClick,
+}: {
+  label: string;
+  icon: any;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors flex-shrink-0 ${
+        active
+          ? "bg-teal text-white"
+          : "bg-white text-ink-slate border border-gray-200 hover:border-gray-300"
+      }`}
+    >
+      <Icon size={12} />
+      {label}
+    </button>
+  );
+}
+
+function StatusPill({
+  label,
+  count,
+  active,
+  onClick,
+  color,
+  icon: Icon,
+}: {
+  label: string;
+  count: number;
+  active: boolean;
+  onClick: () => void;
+  color?: string;
+  icon?: any;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-semibold transition-colors flex-shrink-0 ${
+        active
+          ? "bg-navy text-white"
+          : "bg-white text-ink-slate border border-gray-200 hover:border-gray-300"
+      }`}
+    >
+      {Icon && <Icon size={12} style={{ color: active ? "white" : color }} />}
+      {label}
+      <span
+        className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+          active ? "bg-white/20 text-white" : "bg-gray-100 text-navy"
+        }`}
+      >
+        {count}
+      </span>
+    </button>
+  );
+}
+
+function ClientRow({
+  client,
+  bookkeepers,
+  canEdit,
+  onUpdate,
+}: {
+  client: ClientRow;
+  bookkeepers: Bookkeeper[];
+  canEdit: boolean;
+  onUpdate: (updates: Partial<ClientRow>) => void;
+}) {
+  const statusCfg = STATUS_CONFIG[client.status];
+  const StatusIcon = statusCfg.icon;
+
+  const [statusMenuOpen, setStatusMenuOpen] = useState(false);
+  const [assignMenuOpen, setAssignMenuOpen] = useState(false);
+
+  return (
+    <div
+      className={`grid items-center px-5 py-3 border-b border-gray-100 hover:bg-teal-lighter transition-colors ${
+        !client.is_active ? "opacity-50" : ""
+      }`}
+      style={{ gridTemplateColumns: "1.6fr 0.9fr 1.2fr 1fr 0.85fr 0.9fr 1.1fr 0.4fr" }}
+    >
+      <div className="flex items-center gap-3 min-w-0">
+        <div className="rounded-lg flex items-center justify-center font-bold text-sm flex-shrink-0 w-9 h-9 bg-teal-light text-teal">
+          {client.client_name.charAt(0)}
+        </div>
+        <div className="min-w-0">
+          <div className="font-semibold text-sm text-navy truncate">{client.client_name}</div>
+          <div className="text-xs text-ink-slate flex items-center gap-1">
+            <MapPin size={10} />
+            {client.jurisdiction}{client.state_province ? ` · ${client.state_province}` : ""}
+          </div>
+        </div>
+      </div>
+
+      <div className="relative">
+        <button
+          onClick={() => canEdit && setStatusMenuOpen(!statusMenuOpen)}
+          disabled={!canEdit}
+          className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold disabled:cursor-default"
+          style={{ color: statusCfg.color, backgroundColor: statusCfg.bg }}
+        >
+          <StatusIcon size={11} />
+          {statusCfg.label}
+          {canEdit && <ChevronDown size={10} />}
+        </button>
+
+        {statusMenuOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setStatusMenuOpen(false)} />
+            <div className="absolute left-0 top-full mt-1 z-20 rounded-lg shadow-lg overflow-hidden bg-white border border-gray-200 min-w-[140px]">
+              {Object.entries(STATUS_CONFIG).map(([key, cfg]) => {
+                const Icon = cfg.icon;
+                return (
+                  <button
+                    key={key}
+                    onClick={() => {
+                      if (key !== client.status) onUpdate({ status: key as any });
+                      setStatusMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-teal-lighter"
+                    style={{ color: cfg.color }}
+                  >
+                    <Icon size={12} />
+                    {cfg.label}
+                    {key === client.status && <CheckCircle2 size={11} className="ml-auto" />}
+                  </button>
+                );
+              })}
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Double column */}
+      <div className="min-w-0">
+        {client.double_client_id?.startsWith("pending_") ? (
+          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold bg-red-50 text-red-700 border border-red-200">
+            Not matched
+          </span>
+        ) : (
+          <div className="min-w-0">
+            <div className="text-xs font-semibold text-navy truncate" title={client.double_client_name || ""}>
+              {client.double_client_name || `ID ${client.double_client_id}`}
+            </div>
+            <div className="text-[10px] text-ink-slate">Linked</div>
+          </div>
+        )}
+      </div>
+
+      <div className="relative">
+        <button
+          onClick={() => canEdit && setAssignMenuOpen(!assignMenuOpen)}
+          disabled={!canEdit}
+          className="flex items-center gap-2 disabled:cursor-default"
+        >
+          {client.assigned_bookkeeper_name ? (
+            <>
+              <div className="rounded-full flex items-center justify-center font-bold text-[10px] flex-shrink-0 w-6 h-6 bg-teal-light text-teal">
+                {client.assigned_bookkeeper_name.charAt(0)}
+              </div>
+              <span className="text-xs font-medium text-navy truncate">
+                {client.assigned_bookkeeper_name}
+              </span>
+            </>
+          ) : (
+            <span className="text-xs italic text-ink-light">Unassigned</span>
+          )}
+          {canEdit && <ChevronDown size={10} className="text-ink-light" />}
+        </button>
+
+        {assignMenuOpen && (
+          <>
+            <div className="fixed inset-0 z-10" onClick={() => setAssignMenuOpen(false)} />
+            <div className="absolute left-0 top-full mt-1 z-20 rounded-lg shadow-lg overflow-hidden bg-white border border-gray-200 min-w-[180px] max-h-[300px] overflow-y-auto">
+              <button
+                onClick={() => {
+                  onUpdate({ assigned_bookkeeper_id: null });
+                  setAssignMenuOpen(false);
+                }}
+                className="w-full px-3 py-2 text-left text-xs italic text-ink-slate hover:bg-teal-lighter"
+              >
+                Unassign
+              </button>
+              {bookkeepers.map((b) => (
+                <button
+                  key={b.id}
+                  onClick={() => {
+                    onUpdate({ assigned_bookkeeper_id: b.id });
+                    setAssignMenuOpen(false);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-xs hover:bg-teal-lighter text-navy"
+                >
+                  <div className="rounded-full flex items-center justify-center font-bold text-[10px] flex-shrink-0 w-5 h-5 bg-teal-light text-teal">
+                    {b.full_name.charAt(0)}
+                  </div>
+                  {b.full_name}
+                  {b.id === client.assigned_bookkeeper_id && (
+                    <CheckCircle2 size={11} className="ml-auto text-teal" />
+                  )}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+
+      <div>
+        {client.last_cleanup_at ? (
+          <div>
+            <div className="text-xs font-semibold text-navy">
+              {formatRelativeDate(client.last_cleanup_at)}
+            </div>
+            <div className="text-[10px] text-ink-slate">
+              {new Date(client.last_cleanup_at).toLocaleDateString()}
+            </div>
+          </div>
+        ) : (
+          <span className="text-xs italic text-ink-light">Never</span>
+        )}
+      </div>
+
+      <div className="text-xs">
+        <div className="flex items-center gap-3 text-ink-slate">
+          <span title="Completed cleanups" className="flex items-center gap-1">
+            <FileCheck size={11} />
+            <span className="font-bold text-navy">{client.completed_cleanups}</span>
+          </span>
+          <span title="Active rules" className="flex items-center gap-1">
+            <Zap size={11} />
+            <span className="font-bold text-navy">{client.active_rules}</span>
+          </span>
+          {client.flagged_cleanups > 0 && (
+            <span title="Flagged for review" className="flex items-center gap-1 text-yellow-600">
+              <Flag size={11} />
+              <span className="font-bold">{client.flagged_cleanups}</span>
+            </span>
+          )}
+        </div>
+      </div>
+
+      <div className="flex items-center gap-1 flex-wrap">
+        {client.double_client_id?.startsWith("pending_") ? (
+          <Link
+            href={`/clients/${client.id}/match-double`}
+            className="px-2 py-1 rounded text-[10px] font-semibold bg-red-600 hover:bg-red-700 text-white"
+            title="Match this client to a Double HQ record"
+          >
+            Match
+          </Link>
+        ) : (
+          <>
+            <Link
+              href={`/clients/${client.id}/match-double`}
+              className="px-2 py-1 rounded text-[10px] font-semibold bg-gray-100 text-gray-700 hover:bg-gray-200 border border-gray-200"
+              title="Change the Double HQ match for this client"
+            >
+              Rematch
+            </Link>
+            <Link
+              href={`/jobs/new?client=${client.id}`}
+              className="px-2 py-1 rounded text-[10px] font-semibold bg-teal-light text-teal hover:bg-teal/20"
+              title="New cleanup"
+            >
+              Clean
+            </Link>
+            <Link
+              href={`/rules/new?client=${client.id}`}
+              className="px-2 py-1 rounded text-[10px] font-semibold bg-teal-light text-teal hover:bg-teal/20"
+              title="New rule discovery"
+            >
+              Rules
+            </Link>
+          </>
+        )}
+      </div>
+
+      <div className="flex justify-end">
+        <a
+          href={`https://app.qbo.intuit.com/app/account?cid=${client.qbo_realm_id}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="p-1.5 rounded hover:bg-gray-100"
+          title="Open in QuickBooks"
+        >
+          <ExternalLink size={13} className="text-ink-slate" />
+        </a>
+      </div>
+    </div>
+  );
+}
+
+function ClientCard({
+  client,
+  bookkeepers,
+  canEdit,
+  onUpdate,
+}: {
+  client: ClientRow;
+  bookkeepers: Bookkeeper[];
+  canEdit: boolean;
+  onUpdate: (updates: Partial<ClientRow>) => void;
+}) {
+  const statusCfg = STATUS_CONFIG[client.status];
+  const StatusIcon = statusCfg.icon;
+
+  return (
+    <div className="rounded-xl bg-white border border-gray-200 p-4 hover:shadow-md transition-shadow">
+      <div className="flex items-start justify-between mb-3">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="rounded-lg flex items-center justify-center font-bold text-base flex-shrink-0 w-10 h-10 bg-teal-light text-teal">
+            {client.client_name.charAt(0)}
+          </div>
+          <div className="min-w-0">
+            <div className="font-bold text-sm text-navy truncate">{client.client_name}</div>
+            <div className="text-xs text-ink-slate flex items-center gap-1">
+              <MapPin size={10} />
+              {client.jurisdiction}{client.state_province ? ` · ${client.state_province}` : ""}
+            </div>
+          </div>
+        </div>
+        <span
+          className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider flex-shrink-0"
+          style={{ color: statusCfg.color, backgroundColor: statusCfg.bg }}
+        >
+          <StatusIcon size={9} />
+          {statusCfg.label}
+        </span>
+      </div>
+
+      <div className="grid grid-cols-3 gap-2 my-3 py-3 border-y border-gray-100">
+        <CardStat icon={FileCheck} value={client.completed_cleanups} label="Cleanups" />
+        <CardStat icon={Zap} value={client.active_rules} label="Rules" />
+        <CardStat
+          icon={Flag}
+          value={client.flagged_cleanups}
+          label="Flags"
+          highlight={client.flagged_cleanups > 0}
+        />
+      </div>
+
+      <div className="text-xs text-ink-slate mb-3">
+        {client.assigned_bookkeeper_name ? (
+          <div className="flex items-center gap-1.5">
+            <div className="rounded-full flex items-center justify-center font-bold text-[10px] w-5 h-5 bg-teal-light text-teal">
+              {client.assigned_bookkeeper_name.charAt(0)}
+            </div>
+            <span className="text-navy font-medium">{client.assigned_bookkeeper_name}</span>
+          </div>
+        ) : (
+          <span className="italic">Unassigned</span>
+        )}
+        <div className="flex items-center gap-1 mt-1">
+          <span className="text-ink-light">Double:</span>
+          {client.double_client_id?.startsWith("pending_") ? (
+            <span className="font-semibold text-red-700">Not matched</span>
+          ) : (
+            <span className="font-semibold text-navy truncate" title={client.double_client_name || ""}>
+              {client.double_client_name || `ID ${client.double_client_id}`}
+            </span>
+          )}
+        </div>
+        {client.last_cleanup_at && (
+          <div className="flex items-center gap-1 mt-1">
+            <Clock size={10} />
+            Last cleanup {formatRelativeDate(client.last_cleanup_at)}
+          </div>
+        )}
+      </div>
+
+      <div className="flex gap-2">
+        {client.double_client_id?.startsWith("pending_") ? (
+          <Link
+            href={`/clients/${client.id}/match-double`}
+            className="flex-1 text-center px-3 py-1.5 rounded-md text-xs font-semibold bg-red-600 hover:bg-red-700 text-white"
+          >
+            Match Double →
+          </Link>
+        ) : (
+          <>
+            <Link
+              href={`/jobs/new?client=${client.id}`}
+              className="flex-1 text-center px-3 py-1.5 rounded-md text-xs font-semibold bg-teal hover:bg-teal-dark text-white"
+            >
+              New Cleanup
+            </Link>
+            <Link
+              href={`/rules/new?client=${client.id}`}
+              className="px-3 py-1.5 rounded-md text-xs font-semibold bg-teal-light text-teal hover:bg-teal/20"
+            >
+              Rules
+            </Link>
+            <Link
+              href={`/clients/${client.id}/match-double`}
+              className="px-3 py-1.5 rounded-md text-xs font-semibold bg-gray-100 text-gray-700 hover:bg-gray-200 border border-gray-200"
+              title="Change the Double HQ match"
+            >
+              Rematch
+            </Link>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CardStat({
+  icon: Icon,
+  value,
+  label,
+  highlight,
+}: {
+  icon: any;
+  value: number;
+  label: string;
+  highlight?: boolean;
+}) {
+  return (
+    <div className="text-center">
+      <div className="flex items-center justify-center gap-1 mb-0.5">
+        <Icon size={11} className={highlight ? "text-yellow-600" : "text-ink-slate"} />
+        <span
+          className={`text-sm font-bold ${highlight ? "text-yellow-600" : "text-navy"}`}
+        >
+          {value}
+        </span>
+      </div>
+      <div className="text-[10px] uppercase tracking-wider text-ink-light">{label}</div>
+    </div>
+  );
+}
+
+function formatRelativeDate(iso: string): string {
+  const seconds = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+  const days = Math.floor(seconds / 86400);
+  if (days === 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days}d ago`;
+  if (days < 30) return `${Math.floor(days / 7)}w ago`;
+  if (days < 365) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}

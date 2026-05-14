@@ -1,0 +1,423 @@
+/**
+ * QBO Reclassification Engine
+ * ----------------------------
+ * Line-level transaction reclassification for Bill, Purchase, Expense, VendorCredit.
+ *
+ * Key design decisions:
+ *  - Work at line level (not transaction level) - a Bill with 5 lines hitting 3 accounts,
+ *    we only move the lines hitting the source account, leaving others untouched.
+ *  - Detect reconciled status per-line (cleared field).
+ *  - Detect bank-fed vs manual entries via OnlineBankingTxnReference presence.
+ *  - Append audit memo to transaction PrivateNote (one append per transaction even if
+ *    multiple lines on it get reclassified).
+ *  - Each update increments SyncToken; we capture token at discovery time and refresh
+ *    if stale at execution time.
+ */
+
+import { qboRateLimiter, getValidToken } from "./qbo";
+
+const QBO_BASE =
+  process.env.QBO_ENVIRONMENT === "production"
+    ? "https://quickbooks.api.intuit.com"
+    : "https://sandbox-quickbooks.api.intuit.com";
+
+// Transaction types we support for reclassification
+export const SUPPORTED_TX_TYPES = ["Bill", "Purchase", "Expense", "VendorCredit"] as const;
+export type SupportedTxType = (typeof SUPPORTED_TX_TYPES)[number];
+
+// ============== TYPES ==============
+
+export interface ReclassLine {
+  // Identity
+  transaction_id: string;
+  transaction_type: SupportedTxType;
+  line_id: string;
+  sync_token: string;
+
+  // Context
+  transaction_date: string;          // YYYY-MM-DD
+  transaction_amount: number;        // signed line amount
+  vendor_name: string;
+  current_account_id: string;
+  current_account_name: string;
+  description: string;               // line description, if any
+  private_note: string;              // transaction-level memo
+
+  // Detection flags
+  is_reconciled: boolean;            // line.cleared === "Reconciled"
+  is_bank_fed: boolean;
+  is_manual_entry: boolean;
+}
+
+export interface QBOLine {
+  Id?: string;
+  LineNum?: number;
+  Description?: string;
+  Amount: number;
+  DetailType: string;
+  AccountBasedExpenseLineDetail?: {
+    AccountRef: { value: string; name?: string };
+    TaxCodeRef?: { value: string };
+    BillableStatus?: string;
+    CustomerRef?: { value: string };
+    ClassRef?: { value: string };
+  };
+  // Other line detail types we don't touch
+  JournalEntryLineDetail?: unknown;
+  // Status fields
+  Cleared?: string;                  // "Reconciled" | "Cleared" | undefined
+}
+
+export interface QBOTransaction {
+  Id: string;
+  SyncToken: string;
+  domain?: string;
+  sparse?: boolean;
+  TxnDate: string;
+  TotalAmt?: number;
+  PrivateNote?: string;
+  Line: QBOLine[];
+  VendorRef?: { value: string; name?: string };
+  EntityRef?: { value: string; name?: string };
+  PayeeRef?: { value: string; name?: string };
+  // Bank-fed / online txn marker
+  OnlineBankingTxnReference?: unknown;
+  GlobalTaxCalculation?: string;
+  DocNumber?: string;
+  MetaData?: {
+    CreateTime?: string;
+    LastUpdatedTime?: string;
+  };
+}
+
+// ============== HELPERS ==============
+
+async function qboRequest<T>(
+  realmId: string,
+  accessToken: string,
+  endpoint: string,
+  options: RequestInit = {}
+): Promise<T> {
+  await qboRateLimiter.throttle(realmId);
+  const url = `${QBO_BASE}/v3/company/${realmId}${endpoint}`;
+  const res = await fetch(url, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`QBO API ${res.status} on ${endpoint}: ${body}`);
+  }
+  return res.json();
+}
+
+// ============== TRANSACTION FETCHING ==============
+
+/**
+ * Fetch all transactions hitting a specific account within a date range,
+ * across all 4 supported types. Returns flattened line-level data.
+ */
+export async function fetchTransactionsForAccount(
+  realmId: string,
+  accessToken: string,
+  accountId: string,
+  dateStart: string,    // YYYY-MM-DD
+  dateEnd: string       // YYYY-MM-DD
+): Promise<{
+  lines: ReclassLine[];
+  transactionsPulled: number;
+  transactionsSkippedUnsupported: number;
+}> {
+  const allLines: ReclassLine[] = [];
+  let totalPulled = 0;
+  let skippedUnsupported = 0;
+
+  for (const txType of SUPPORTED_TX_TYPES) {
+    let page = 0;
+    const pageSize = 1000;
+    let hasMore = true;
+
+    while (hasMore) {
+      const startPosition = page * pageSize + 1; // QBO is 1-indexed
+      const query = encodeURIComponent(
+        `SELECT * FROM ${txType} WHERE TxnDate >= '${dateStart}' AND TxnDate <= '${dateEnd}' STARTPOSITION ${startPosition} MAXRESULTS ${pageSize}`
+      );
+
+      try {
+        const data: any = await qboRequest(realmId, accessToken, `/query?query=${query}`);
+        const txs: QBOTransaction[] = data.QueryResponse?.[txType] || [];
+        totalPulled += txs.length;
+
+        for (const tx of txs) {
+          // Find lines that hit the source account
+          const matchingLines = (tx.Line || []).filter((line) => {
+            const detail = line.AccountBasedExpenseLineDetail;
+            return detail?.AccountRef?.value === accountId;
+          });
+
+          if (matchingLines.length === 0) continue;
+
+          // Detect status flags at transaction level
+          const isBankFed = !!tx.OnlineBankingTxnReference;
+          // Manual entry heuristic: no online banking ref AND no DocNumber suggests manual
+          const isManualEntry = !isBankFed && !tx.DocNumber;
+
+          const vendorName =
+            tx.VendorRef?.name ||
+            tx.EntityRef?.name ||
+            tx.PayeeRef?.name ||
+            "Unknown vendor";
+
+          for (const line of matchingLines) {
+            const isReconciled = line.Cleared === "Reconciled";
+
+            allLines.push({
+              transaction_id: tx.Id,
+              transaction_type: txType,
+              line_id: line.Id || "",
+              sync_token: tx.SyncToken,
+              transaction_date: tx.TxnDate,
+              transaction_amount: line.Amount || 0,
+              vendor_name: vendorName,
+              current_account_id: accountId,
+              current_account_name:
+                line.AccountBasedExpenseLineDetail?.AccountRef?.name || "",
+              description: line.Description || "",
+              private_note: tx.PrivateNote || "",
+              is_reconciled: isReconciled,
+              is_bank_fed: isBankFed,
+              is_manual_entry: isManualEntry,
+            });
+          }
+        }
+
+        // QBO returns at most pageSize results
+        hasMore = txs.length >= pageSize;
+        page++;
+      } catch (err: any) {
+        // Some transaction types may not be queryable - log and continue
+        console.warn(`Failed to query ${txType}:`, err.message);
+        skippedUnsupported++;
+        break;
+      }
+    }
+  }
+
+  return {
+    lines: allLines,
+    transactionsPulled: totalPulled,
+    transactionsSkippedUnsupported: skippedUnsupported,
+  };
+}
+
+// ============== QBO BOOKS CLOSING DATE ==============
+
+/**
+ * Get the company's books closing date setting from QBO Preferences.
+ * Transactions before this date require closing password and we skip them.
+ */
+export async function getCompanyClosingDate(
+  realmId: string,
+  accessToken: string
+): Promise<string | null> {
+  try {
+    const data: any = await qboRequest(
+      realmId,
+      accessToken,
+      "/preferences"
+    );
+    const prefs = data.Preferences;
+    return prefs?.AccountingInfoPrefs?.BookCloseDate || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Returns true if the given transaction date falls in QBO's closed period.
+ */
+export function isInClosedPeriod(
+  txnDate: string,
+  bookCloseDate: string | null
+): boolean {
+  if (!bookCloseDate) return false;
+  return new Date(txnDate) <= new Date(bookCloseDate);
+}
+
+// ============== TRANSACTION UPDATE ==============
+
+/**
+ * Refetch a single transaction (we need fresh SyncToken at update time).
+ */
+export async function refetchTransaction(
+  realmId: string,
+  accessToken: string,
+  txType: SupportedTxType,
+  txId: string
+): Promise<QBOTransaction> {
+  const data: any = await qboRequest(
+    realmId,
+    accessToken,
+    `/${txType.toLowerCase()}/${txId}`
+  );
+  return data[txType];
+}
+
+/**
+ * Update one or more line items in a transaction to point at a new target account.
+ * Appends an audit memo to the transaction's PrivateNote.
+ *
+ * Returns the updated transaction.
+ */
+export async function reclassifyTransactionLines(
+  realmId: string,
+  accessToken: string,
+  params: {
+    txType: SupportedTxType;
+    txId: string;
+    lineUpdates: Array<{
+      line_id: string;
+      new_account_id: string;
+      new_account_name?: string;
+    }>;
+    auditMemo: string;       // appended to PrivateNote
+  }
+): Promise<QBOTransaction> {
+  // Step 1: Refetch fresh transaction (get current SyncToken)
+  const tx = await refetchTransaction(realmId, accessToken, params.txType, params.txId);
+
+  // Step 2: Mutate matching lines
+  const lineUpdateMap = new Map(params.lineUpdates.map((u) => [u.line_id, u]));
+  const updatedLines = tx.Line.map((line) => {
+    if (!line.Id) return line;
+    const update = lineUpdateMap.get(line.Id);
+    if (!update) return line;
+
+    return {
+      ...line,
+      AccountBasedExpenseLineDetail: {
+        ...(line.AccountBasedExpenseLineDetail || {
+          AccountRef: { value: "" },
+        }),
+        AccountRef: {
+          value: update.new_account_id,
+          ...(update.new_account_name && { name: update.new_account_name }),
+        },
+      },
+    };
+  });
+
+  // Step 3: Append memo (avoid double-appending if memo already contains the same line)
+  const memoAppendDelim = "\n";
+  const existingMemo = tx.PrivateNote || "";
+  const newMemo = existingMemo.includes(params.auditMemo)
+    ? existingMemo
+    : (existingMemo ? existingMemo + memoAppendDelim : "") + params.auditMemo;
+
+  // Step 4: Full update via POST with sparse=true to be safe
+  const updatePayload = {
+    ...tx,
+    Line: updatedLines,
+    PrivateNote: newMemo,
+    sparse: false, // full update - all lines must be present (we preserved non-matching lines above)
+  };
+
+  const data: any = await qboRequest(
+    realmId,
+    accessToken,
+    `/${params.txType.toLowerCase()}?operation=update`,
+    {
+      method: "POST",
+      body: JSON.stringify(updatePayload),
+    }
+  );
+
+  return data[params.txType];
+}
+
+// ============== VENDOR NORMALIZATION ==============
+
+/**
+ * Normalize "SHERWIN-WILLIAMS #4521" and "Sherwin Williams Co" to "SHERWIN WILLIAMS".
+ * Used for grouping txs by vendor in scrub mode.
+ */
+export function normalizeVendorName(raw: string): string {
+  return raw
+    .toUpperCase()
+    .replace(/[#\-_*\/\\.,]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/\b(CO|INC|LLC|LTD|CORP|COMPANY|THE|STORE|#\d+|\d+)\b/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+// ============== MEMO BUILDER ==============
+
+/**
+ * Build the standard IronBooks audit memo for reclassed transactions.
+ * Format: [IronBooks reclass YYYY-MM-DD by {name}: {reason}]
+ */
+export function buildAuditMemo(
+  bookkeeperName: string,
+  reason: string,
+  date?: Date
+): string {
+  const d = date || new Date();
+  const dateStr = d.toISOString().split("T")[0];
+  // Truncate reason to keep memos reasonable (PrivateNote has size limits)
+  const trimmedReason = reason.length > 80 ? reason.slice(0, 77) + "..." : reason;
+  return `[IronBooks reclass ${dateStr} by ${bookkeeperName}: ${trimmedReason}]`;
+}
+
+// ============== GROUP HELPERS (for scrub mode) ==============
+
+export interface VendorGroup {
+  vendor_pattern: string;       // normalized name
+  display_name: string;         // a representative original name
+  lines: ReclassLine[];
+  total_amount: number;
+  earliest_date: string;
+  latest_date: string;
+}
+
+/**
+ * Group lines by normalized vendor name. Used for scrub mode AI batching.
+ * Returns groups sorted by line count (largest first).
+ */
+export function groupLinesByVendor(lines: ReclassLine[]): VendorGroup[] {
+  const groups = new Map<string, VendorGroup>();
+
+  for (const line of lines) {
+    const pattern = normalizeVendorName(line.vendor_name);
+    if (!pattern) continue;
+
+    let group = groups.get(pattern);
+    if (!group) {
+      group = {
+        vendor_pattern: pattern,
+        display_name: line.vendor_name,
+        lines: [],
+        total_amount: 0,
+        earliest_date: line.transaction_date,
+        latest_date: line.transaction_date,
+      };
+      groups.set(pattern, group);
+    }
+
+    group.lines.push(line);
+    group.total_amount += Math.abs(line.transaction_amount);
+    if (line.transaction_date < group.earliest_date) group.earliest_date = line.transaction_date;
+    if (line.transaction_date > group.latest_date) group.latest_date = line.transaction_date;
+  }
+
+  return Array.from(groups.values()).sort((a, b) => b.lines.length - a.lines.length);
+}
+
+// ============== EXPORTS ==============
+
+export { getValidToken };

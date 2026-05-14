@@ -1,0 +1,89 @@
+import { AppShell } from "@/components/AppShell";
+import { TopBar } from "@/components/TopBar";
+import { createServerSupabase, createServiceSupabase } from "@/lib/supabase";
+import { redirect } from "next/navigation";
+import { ReclassReview } from "./review-client";
+import { ReclassDiscoveryPending } from "./discovery-pending";
+
+export default async function ReclassReviewPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  const supabase = await createServerSupabase();
+  const { data: { user } } = await supabase.auth.getUser();
+  if (!user) redirect("/auth/login");
+
+  const service = createServiceSupabase();
+  const { data: job } = await service
+    .from("reclass_jobs_view")
+    .select("*")
+    .eq("id", id)
+    .single();
+
+  if (!job) {
+    return (
+      <AppShell>
+        <TopBar title="Reclass Job Not Found" />
+        <div className="px-8 py-6">
+          <div className="p-4 bg-red-50 text-red-800 rounded-lg">
+            Job not found. <a href="/history" className="underline">Back to history</a>
+          </div>
+        </div>
+      </AppShell>
+    );
+  }
+
+  // If discovery still running, show pending page
+  if (job.status === "executing" || !job.ai_completed_at) {
+    return (
+      <AppShell>
+        <TopBar
+          title={`Reclassification: ${job.client_name}`}
+          subtitle={`Discovery in progress · ${job.workflow}`}
+        />
+        <div className="px-8 py-6 max-w-4xl">
+          <ReclassDiscoveryPending jobId={id} />
+        </div>
+      </AppShell>
+    );
+  }
+
+  // If executing/complete, redirect to execute page
+  if (job.execution_started_at) {
+    redirect(`/reclass/${id}/execute`);
+  }
+
+  // Load all reclassifications
+  const { data: reclassifications } = await service
+    .from("reclassifications")
+    .select("*")
+    .eq("reclass_job_id", id)
+    .order("ai_confidence", { ascending: false })
+    .order("vendor_name");
+
+  // Check if user can use admin overrides
+  const { data: userProfile } = await service
+    .from("users")
+    .select("role")
+    .eq("id", user.id)
+    .single();
+  const userRole = userProfile?.role || "bookkeeper";
+
+  return (
+    <AppShell>
+      <TopBar
+        title={`Reclassification: ${job.client_name}`}
+        subtitle={`Review · ${job.workflow === "consolidation" ? "Account Consolidation" : "AI Scrub"}`}
+      />
+      <div className="px-8 py-6">
+        <ReclassReview
+          job={job}
+          rows={reclassifications || []}
+          userRole={userRole}
+        />
+      </div>
+    </AppShell>
+  );
+}
