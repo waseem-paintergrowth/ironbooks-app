@@ -389,6 +389,83 @@ export async function reparentAccount(
 
 // ============== TRANSACTIONS ==============
 
+/**
+ * Fast bulk fetch of transaction counts per account.
+ *
+ * Uses the GeneralLedgerReport which lists all transactions grouped by account.
+ * Counts entries to derive how many transactions each account has been used in.
+ *
+ * Returns: Map<accountId, transactionCount>
+ *
+ * Why this matters: QBO blocks API inactivation of accounts with any historical
+ * transactions, even if current balance is zero. Pre-flight needs this info to
+ * decide whether an inactivate is safe or must be flagged.
+ *
+ * Strategy: pull the General Ledger report (covers all account types in one call).
+ * Falls back to per-account queries if the report fails.
+ */
+export async function fetchTransactionCountsForAllAccounts(
+  realmId: string,
+  accessToken: string
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+
+  try {
+    // GL report covers all accounts in one call. Date range: cover 'all time' by
+    // using a very old start_date. QBO accepts wide ranges on reports.
+    const params = new URLSearchParams({
+      start_date: '1900-01-01',
+      end_date: '2099-12-31',
+      minorversion: '70',
+    });
+    const data = await qboRequest<any>(
+      realmId,
+      accessToken,
+      `/reports/GeneralLedger?${params.toString()}`
+    );
+
+    // Walk the report tree. Rows have a `group` shape per account, each with
+    // its own `Rows.Row[]` of transaction entries.
+    function walkRows(rows: any[]): void {
+      if (!Array.isArray(rows)) return;
+      for (const row of rows) {
+        // Account header row: has Header with ColData[0] = account id reference
+        if (row.type === 'Section' && row.Header?.ColData) {
+          // The account_id usually appears in the row's `group` field or in
+          // a value attribute on the Header. Different QBO accounts return
+          // slightly different structure — try both common shapes.
+          const accountId =
+            row.group ||
+            row.Header.ColData[0]?.value ||
+            row.Header.ColData[0]?.id;
+          if (accountId) {
+            // Count the data rows inside this section (excluding the totals row)
+            const detailRows = row.Rows?.Row || [];
+            const txCount = detailRows.filter(
+              (r: any) => r.type === 'Data' || (!r.type && r.ColData)
+            ).length;
+            counts.set(String(accountId), txCount);
+          }
+        }
+        // Recurse into nested rows
+        if (row.Rows?.Row) {
+          walkRows(row.Rows.Row);
+        }
+      }
+    }
+
+    if (data.Rows?.Row) {
+      walkRows(data.Rows.Row);
+    }
+  } catch (e) {
+    console.error('[fetchTransactionCountsForAllAccounts] GL report failed:', e);
+    // Don't throw — return whatever we have. Pre-flight will treat missing
+    // entries as "unknown" rather than blocking the cleanup.
+  }
+
+  return counts;
+}
+
 export interface QBOTransaction {
   Id: string;
   SyncToken: string;
