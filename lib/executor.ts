@@ -242,10 +242,31 @@ export async function executeJob(jobId: string): Promise<{
             parentIdMap.set(action.new_parent_name!, parentId);
           }
 
+          // Defensive: QBO requires BOTH AccountType and AccountSubType.
+          // If Claude's analysis didn't fill in subtype, fall back to master_coa.
+          let accountType = action.new_type;
+          let accountSubType = action.new_subtype;
+          if (!accountType || !accountSubType) {
+            const { data: master } = await ctx.supabase
+              .from("master_coa")
+              .select("qbo_account_type, qbo_account_subtype")
+              .eq("account_name", action.new_name!)
+              .maybeSingle();
+            if (master) {
+              accountType = accountType || master.qbo_account_type;
+              accountSubType = accountSubType || master.qbo_account_subtype;
+            }
+          }
+          if (!accountType || !accountSubType) {
+            throw new Error(
+              `Missing AccountType/AccountSubType for "${action.new_name}" and not found in master COA — skipping.`
+            );
+          }
+
           const created = await qbo.createAccount(ctx.realmId, ctx.accessToken, {
             name: action.new_name!,
-            accountType: action.new_type!,
-            accountSubType: action.new_subtype!,
+            accountType,
+            accountSubType,
             parentRefId: parentId,
             taxCodeRef: action.tax_code_ref || undefined,
           });
@@ -278,12 +299,15 @@ export async function executeJob(jobId: string): Promise<{
           const current = accountMap.get(action.qbo_account_id!);
           if (!current) throw new Error("Account no longer exists in QBO");
 
+          // Only send AccountSubType if it actually matches the existing AccountType
+          // (otherwise QBO returns 2010 "invalid property"). The rename action should
+          // primarily change the Name. Subtype changes are risky and we skip them.
           const renamed = await qbo.renameAccount(
             ctx.realmId, ctx.accessToken,
             action.qbo_account_id!, (current as any).SyncToken,
             action.new_name!,
             {
-              newSubType: action.new_subtype || undefined,
+              // Intentionally NOT passing newSubType — too risky on rename, causes 2010
               taxCodeRef: action.tax_code_ref || undefined,
             }
           );
