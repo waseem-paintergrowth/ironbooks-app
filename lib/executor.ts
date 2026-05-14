@@ -46,7 +46,7 @@ async function logProgress(
 
 async function logActionResult(
   ctx: ExecutionContext,
-  actionId: string,
+  actionId: string | null,
   eventType: string,
   payload: unknown
 ) {
@@ -169,9 +169,64 @@ export async function executeJob(jobId: string): Promise<{
       await logProgress(ctx, "stage_complete", `Parents created: ${stats.created}`, { stage: "create_parents" });
     }
 
-    // STAGE 2: Create children
+    // STAGE 1.5: Auto-create any missing parent accounts referenced by child creations.
+    // Claude's analysis sometimes assumes parents like "Vehicle Expenses" exist when they don't.
+    // We look up the parent's QBO type from the master COA and create it on the fly.
     const childCreations = actions.filter((a) => a.action === "create" && a.new_parent_name);
+    if (childCreations.length > 0) {
+      const allAccountsCache = await qbo.fetchAllAccounts(ctx.realmId, ctx.accessToken);
+      const existingNames = new Set(allAccountsCache.map((a) => a.Name));
 
+      // Distinct parent names referenced by children that aren't already known
+      const neededParents = Array.from(
+        new Set(
+          childCreations
+            .map((a) => a.new_parent_name!)
+            .filter((p) => !parentIdMap.has(p) && !existingNames.has(p))
+        )
+      );
+
+      if (neededParents.length > 0) {
+        await logProgress(ctx, "stage_start", `Auto-creating ${neededParents.length} missing parent accounts`,
+          { stage: "create_missing_parents", total: neededParents.length });
+
+        // Fetch master COA rows for these parent names to get correct types/subtypes
+        const { data: masterMatches } = await ctx.supabase
+          .from("master_coa")
+          .select("account_name, qbo_account_type, qbo_account_subtype, is_parent")
+          .in("account_name", neededParents);
+
+        const masterByName = new Map<string, any>(
+          (masterMatches || []).map((m) => [m.account_name, m])
+        );
+
+        for (const parentName of neededParents) {
+          try {
+            const master = masterByName.get(parentName);
+            // Fall back to "Expense / OtherMiscellaneousExpense" if not found in master
+            // (rare — usually means Claude invented a parent name not in master COA)
+            const accountType = master?.qbo_account_type || "Expense";
+            const accountSubType = master?.qbo_account_subtype || "OtherMiscellaneousExpense";
+
+            const created = await qbo.createAccount(ctx.realmId, ctx.accessToken, {
+              name: parentName,
+              accountType,
+              accountSubType,
+            });
+            parentIdMap.set(parentName, created.Id);
+            await logActionResult(ctx, null, "qbo_create_missing_parent",
+              { name: parentName, id: created.Id, type: accountType, subtype: accountSubType });
+            stats.created++;
+          } catch (e: any) {
+            errors.push(`Auto-create missing parent "${parentName}" failed: ${e.message}`);
+            await logProgress(ctx, "error", `Failed missing parent: ${parentName}`, { error: e.message });
+          }
+        }
+        await logProgress(ctx, "stage_complete", `Missing parents created`, { stage: "create_missing_parents" });
+      }
+    }
+
+    // STAGE 2: Create children
     if (childCreations.length > 0) {
       await logProgress(ctx, "stage_start", `Creating ${childCreations.length} sub-accounts`,
         { stage: "create_children", total: childCreations.length });
