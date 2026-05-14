@@ -45,14 +45,24 @@ export async function GET(
 
   const { data: logs } = await query;
 
-  // Calculate progress
+  // Calculate progress.
+  // IMPORTANT: denominator must be ONLY actionable items (create/rename/delete).
+  // `keep` actions are no-ops and never get executed=true, so including them
+  // would make the progress bar permanently stuck below 100%.
+  // `flag` actions are also excluded — they're intentionally not executed.
   const { data: actionStats } = await supabase
     .from("coa_actions")
-    .select("executed")
+    .select("executed, action, error_message")
     .eq("job_id", jobId);
 
-  const totalActions = actionStats?.length || 0;
-  const completedActions = actionStats?.filter((a) => a.executed).length || 0;
+  const actionable = (actionStats || []).filter(
+    (a) => a.action === "create" || a.action === "rename" || a.action === "delete"
+  );
+  const totalActions = actionable.length;
+  const completedActions = actionable.filter((a) => a.executed).length;
+  const failedActions = actionable.filter((a) => !a.executed && a.error_message).length;
+  const skippedActions = (actionStats || []).filter((a) => a.action === "flag").length;
+  const keepActions = (actionStats || []).filter((a) => a.action === "keep").length;
   const progressPct = totalActions > 0 ? Math.round((completedActions / totalActions) * 100) : 0;
 
   return NextResponse.json({
@@ -64,6 +74,10 @@ export async function GET(
     progress: {
       total: totalActions,
       completed: completedActions,
+      failed: failedActions,
+      flagged: skippedActions,
+      keep: keepActions,
+      grand_total: (actionStats || []).length,
       percentage: progressPct,
     },
     stats: {
