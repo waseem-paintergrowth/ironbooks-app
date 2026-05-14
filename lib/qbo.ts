@@ -190,8 +190,18 @@ async function qboRequest<T>(
   });
 
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(`QBO API ${res.status}: ${body}`);
+    const responseBody = await res.text();
+    // Include the request body in the error so audit_log captures EXACTLY
+    // what we sent to QBO when something fails. Critical for debugging 2010s.
+    let sentBody: any = '(none)';
+    try {
+      sentBody = options.body ? JSON.parse(options.body as string) : '(none)';
+    } catch {
+      sentBody = options.body;
+    }
+    throw new Error(
+      `QBO API ${res.status} at ${endpoint}: ${responseBody} | Request body sent: ${JSON.stringify(sentBody)}`
+    );
   }
 
   return res.json();
