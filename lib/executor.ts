@@ -307,7 +307,9 @@ export async function executeJob(jobId: string): Promise<{
             action.qbo_account_id!, (current as any).SyncToken,
             action.new_name!,
             {
-              // Intentionally NOT passing newSubType — too risky on rename, causes 2010
+              // Pass the current account so renameAccount preserves SubAccount/ParentRef/AccountType.
+              // Without this, QBO 2010s on sub-account renames.
+              currentAccount: current as any,
               taxCodeRef: action.tax_code_ref || undefined,
             }
           );
@@ -342,7 +344,8 @@ export async function executeJob(jobId: string): Promise<{
 
           const inactive = await qbo.inactivateAccount(
             ctx.realmId, ctx.accessToken,
-            action.qbo_account_id!, (current as any).SyncToken
+            action.qbo_account_id!, (current as any).SyncToken,
+            current as any
           );
 
           await markActionComplete(ctx, action.id, inactive.Id, inactive);
