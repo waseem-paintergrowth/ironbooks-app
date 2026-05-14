@@ -4,7 +4,7 @@ Next.js 15 + Supabase + Claude application for IronBooks bookkeeping operations.
 
 Supabase backend (`ironbooks-prod`, project ID `omzobviyhrgiqywfjzwo`) is already deployed with all schema, RLS, and 108-account master COA seeded.
 
----
+--- Ironbooks
 
 ## What's Included
 
