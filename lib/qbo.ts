@@ -266,7 +266,6 @@ export async function renameAccount(
     Id: accountId,
     SyncToken: syncToken,
     Name: newName,
-    sparse: true,
   };
 
   if (options?.newSubType) body.AccountSubType = options.newSubType;
@@ -275,7 +274,7 @@ export async function renameAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?minorversion=70',
+    '/account?operation=update&sparse=true&minorversion=70',
     { method: 'POST', body: JSON.stringify(body) }
   );
 
@@ -294,14 +293,13 @@ export async function inactivateAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?operation=update&minorversion=70',
+    '/account?operation=update&sparse=true&minorversion=70',
     {
       method: 'POST',
       body: JSON.stringify({
         Id: accountId,
         SyncToken: syncToken,
         Active: false,
-        sparse: true,
       }),
     }
   );
@@ -322,7 +320,7 @@ export async function reparentAccount(
   const data = await qboRequest<{ Account: QBOAccount }>(
     realmId,
     accessToken,
-    '/account?minorversion=70',
+    '/account?operation=update&sparse=true&minorversion=70',
     {
       method: 'POST',
       body: JSON.stringify({
@@ -330,7 +328,6 @@ export async function reparentAccount(
         SyncToken: syncToken,
         ParentRef: { value: newParentId },
         SubAccount: true,
-        sparse: true,
       }),
     }
   );
@@ -434,7 +431,6 @@ export async function reclassifyTransaction(
       body: JSON.stringify({
         ...transaction,
         Line: updatedLines,
-        sparse: false,
       }),
     }
   );
