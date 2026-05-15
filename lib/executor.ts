@@ -30,6 +30,43 @@ interface ExecutionStats {
   duration_seconds: number;
 }
 
+/**
+ * One entry in the Manual Cleanup Report.
+ *
+ * Generated when COA cleanup hits a QBO platform limitation that the user
+ * must resolve manually in QBO's UI (typically: account has transactions or
+ * non-zero balance, system-protected accounts, name conflicts, etc).
+ *
+ * Persisted to coa_jobs.manual_cleanup_items as a JSONB array so it shows up
+ * in history and on the client view after the cleanup completes.
+ */
+export interface ManualCleanupItem {
+  account_id: string | null;
+  account_name: string;
+  intended_action: "rename" | "inactivate" | "create";
+  reason: string;
+  suggestion: string;
+  qbo_response?: string;
+}
+
+/**
+ * QBO returns code 2010 ("Request has invalid or unsupported property") for
+ * many platform-level rejections — most commonly when trying to inactivate
+ * an account that has historical transactions or a non-zero balance.
+ *
+ * The QBO web UI lets users force these changes after a warning popup; the
+ * REST API does not. We detect these and route them to the Manual Cleanup
+ * Report instead of treating them as errors.
+ */
+function isQboLimitationError(err: any): boolean {
+  const msg = String(err?.message || err || "");
+  return (
+    msg.includes("\"code\":\"2010\"") ||
+    msg.includes("Request has invalid or unsupported property") ||
+    msg.includes("\"code\":\"2170\"") // "Invalid Enumeration" — often hit on parent type conflicts
+  );
+}
+
 async function logProgress(
   ctx: ExecutionContext,
   eventType: string,
@@ -123,6 +160,10 @@ export async function executeJob(jobId: string): Promise<{
   const supabase = createServiceSupabase();
   const startTime = Date.now();
   const errors: string[] = [];
+  // Manual cleanup report — items the user must handle in QBO UI manually.
+  // Typically QBO platform limitations (account has transactions, system-protected, etc).
+  // Different from `errors` which should ONLY contain unexpected failures.
+  const manualCleanupItems: ManualCleanupItem[] = [];
   const stats: ExecutionStats = {
     created: 0, renamed: 0, reclassified: 0, inactivated: 0, duration_seconds: 0,
   };
@@ -502,9 +543,35 @@ export async function executeJob(jobId: string): Promise<{
             { from: action.current_name, to: renamed.Name });
           stats.renamed++;
         } catch (e: any) {
-          errors.push(`Rename "${action.current_name}" failed: ${e.message}`);
-          await markActionFailed(ctx, action.id, e.message);
-          await logProgress(ctx, "error", `Failed: ${action.current_name}`, { error: e.message });
+          if (isQboLimitationError(e)) {
+            manualCleanupItems.push({
+              account_id: action.qbo_account_id ?? null,
+              account_name: action.current_name || "Unknown account",
+              intended_action: "rename",
+              reason:
+                `Cannot rename to "${action.new_name}" via API — QBO rejected the change. This usually means the new name conflicts with an existing account, the type/subtype combo isn't valid for this account, or the parent account has restrictions.`,
+              suggestion:
+                `Open QBO → Chart of Accounts → find "${action.current_name}". Rename manually in the UI. If the name already exists, decide whether to merge the two accounts.`,
+              qbo_response: e.message,
+            });
+            await ctx.supabase
+              .from("coa_actions")
+              .update({
+                executed: false,
+                error_message: null,
+                flagged_reason:
+                  "Manual cleanup required: QBO rejected this rename. See Manual Cleanup Report.",
+              })
+              .eq("id", action.id);
+            await logActionResult(ctx, action.id, "manual_cleanup_required", {
+              name: action.current_name,
+              reason: "QBO rejected rename (likely name conflict or type restriction)",
+            });
+          } else {
+            errors.push(`Rename "${action.current_name}" failed: ${e.message}`);
+            await markActionFailed(ctx, action.id, e.message);
+            await logProgress(ctx, "error", `Failed: ${action.current_name}`, { error: e.message });
+          }
         }
       }
       await logProgress(ctx, "stage_complete", `Renames complete`, { stage: "rename" });
@@ -535,8 +602,36 @@ export async function executeJob(jobId: string): Promise<{
           await logActionResult(ctx, action.id, "qbo_inactivate", { name: current.Name });
           stats.inactivated++;
         } catch (e: any) {
-          errors.push(`Inactivate "${action.current_name}" failed: ${e.message}`);
-          await markActionFailed(ctx, action.id, e.message);
+          if (isQboLimitationError(e)) {
+            // QBO platform limit (most often: account has historical transactions
+            // or non-zero balance). NOT an error — route to manual cleanup report.
+            manualCleanupItems.push({
+              account_id: action.qbo_account_id ?? null,
+              account_name: action.current_name || "Unknown account",
+              intended_action: "inactivate",
+              reason:
+                "Cannot inactivate via API — this account has activity (transactions, balance, or sub-accounts) that QBO won't let us remove programmatically.",
+              suggestion:
+                "Open QBO → Chart of Accounts → find this account. Either (1) reclassify its transactions to another account and zero out the balance, then mark it inactive in the QBO UI, or (2) leave it active if it's still needed.",
+              qbo_response: e.message,
+            });
+            await ctx.supabase
+              .from("coa_actions")
+              .update({
+                executed: false,
+                error_message: null,
+                flagged_reason:
+                  "Manual cleanup required: account has activity. See Manual Cleanup Report.",
+              })
+              .eq("id", action.id);
+            await logActionResult(ctx, action.id, "manual_cleanup_required", {
+              name: action.current_name,
+              reason: "QBO blocks API inactivation (likely has transactions)",
+            });
+          } else {
+            errors.push(`Inactivate "${action.current_name}" failed: ${e.message}`);
+            await markActionFailed(ctx, action.id, e.message);
+          }
         }
       }
       await logProgress(ctx, "stage_complete", `Inactivations complete`, { stage: "inactivate" });
@@ -567,10 +662,13 @@ export async function executeJob(jobId: string): Promise<{
       execution_completed_at: new Date().toISOString(),
       execution_duration_seconds: stats.duration_seconds,
       error_message: errors.length > 0 ? errors.join("; ") : null,
+      manual_cleanup_items: manualCleanupItems as any,
     }).eq("id", jobId);
 
-    await logProgress(ctx, "job_complete", `Job complete in ${stats.duration_seconds}s`,
-      { stats, error_count: errors.length });
+    await logProgress(ctx, "job_complete",
+      `Job complete in ${stats.duration_seconds}s` +
+      (manualCleanupItems.length > 0 ? ` (${manualCleanupItems.length} items need manual cleanup)` : ""),
+      { stats, error_count: errors.length, manual_cleanup_count: manualCleanupItems.length });
 
     return { success: errors.length === 0, errors, stats };
   } catch (fatalError: any) {
