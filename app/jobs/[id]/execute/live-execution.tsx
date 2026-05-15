@@ -12,12 +12,22 @@ interface AuditEvent {
   action_id: string | null;
 }
 
+interface ManualCleanupItem {
+  account_id: string | null;
+  account_name: string;
+  intended_action: "rename" | "inactivate" | "create";
+  reason: string;
+  suggestion: string;
+  qbo_response?: string;
+}
+
 interface StatusResponse {
   status: string;
   execution_started_at: string | null;
   execution_completed_at: string | null;
   duration_seconds: number | null;
   error_message: string | null;
+  manual_cleanup_items: ManualCleanupItem[];
   progress: { total: number; completed: number; percentage: number };
   stats: {
     to_rename: number | null;
@@ -165,11 +175,53 @@ export function LiveExecution({
         </div>
       </div>
 
-      {/* Error message */}
+      {/* Error message — only for true errors, not platform limits */}
       {status?.error_message && (
         <div className="bg-yellow-50 border border-yellow-200 rounded-xl p-4 mb-6">
           <p className="text-sm font-semibold text-navy mb-1">⚠ Some operations had issues:</p>
           <p className="text-xs text-ink-slate whitespace-pre-wrap">{status.error_message}</p>
+        </div>
+      )}
+
+      {/* Manual Cleanup Report — items the user must handle in QBO manually */}
+      {status?.manual_cleanup_items && status.manual_cleanup_items.length > 0 && (
+        <div className="bg-white border border-orange-200 rounded-xl p-5 mb-6">
+          <div className="flex items-start gap-3 mb-4">
+            <AlertTriangle size={20} className="text-orange-500 mt-0.5 flex-shrink-0" />
+            <div>
+              <h3 className="font-bold text-sm text-navy">
+                Manual Cleanup Report ({status.manual_cleanup_items.length} {status.manual_cleanup_items.length === 1 ? "item" : "items"})
+              </h3>
+              <p className="text-xs text-ink-slate mt-1">
+                These accounts could not be auto-cleaned because of QBO platform limits
+                (typically: account has transactions, balance, or naming conflicts).
+                Please handle each one manually in QBO using the steps below.
+              </p>
+            </div>
+          </div>
+          <div className="space-y-3">
+            {status.manual_cleanup_items.map((item, i) => (
+              <div key={i} className="border border-gray-200 rounded-lg p-4 bg-gray-50">
+                <div className="flex items-start justify-between gap-3 mb-2">
+                  <div>
+                    <p className="font-semibold text-sm text-navy">{item.account_name}</p>
+                    <p className="text-[11px] text-ink-slate uppercase tracking-wide font-semibold mt-0.5">
+                      Intended action: {item.intended_action}
+                    </p>
+                  </div>
+                  <span className="text-[10px] bg-orange-100 text-orange-800 px-2 py-1 rounded font-semibold uppercase tracking-wide">
+                    Manual
+                  </span>
+                </div>
+                <p className="text-xs text-ink-slate mb-2">
+                  <span className="font-semibold text-navy">Why: </span>{item.reason}
+                </p>
+                <p className="text-xs text-ink-slate">
+                  <span className="font-semibold text-navy">What to do: </span>{item.suggestion}
+                </p>
+              </div>
+            ))}
+          </div>
         </div>
       )}
 
