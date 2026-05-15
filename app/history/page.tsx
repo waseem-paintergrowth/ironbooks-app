@@ -25,6 +25,7 @@ export default async function HistoryPage() {
         accounts_flagged,
         flagged_for_lisa,
         error_message,
+        manual_cleanup_items,
         bookkeeper_id,
         client_link_id,
         client_links (client_name, jurisdiction, state_province),
@@ -113,6 +114,7 @@ export default async function HistoryPage() {
       created: j.accounts_to_create || 0,
       deleted: j.accounts_to_delete || 0,
       flagged: j.accounts_flagged || 0,
+      manual_cleanup: Array.isArray(j.manual_cleanup_items) ? j.manual_cleanup_items.length : 0,
     },
   }));
 
