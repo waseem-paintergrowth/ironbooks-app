@@ -457,6 +457,7 @@ function JobRow({ job }: { job: UnifiedJob }) {
               { label: "deleted", value: job.summary.deleted },
               { label: "flagged", value: job.summary.flagged, highlight: !!job.summary.flagged },
               { label: "manual", value: job.summary.manual_cleanup ?? 0, highlight: !!job.summary.manual_cleanup },
+              { label: "merges", value: job.summary.merges ?? 0, highlight: !!job.summary.merges },
             ]}
           />
         ) : job.type === "reclass" ? (
