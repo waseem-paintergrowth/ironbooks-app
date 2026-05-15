@@ -25,7 +25,7 @@ export async function GET(
   // Get current job state
   const { data: job } = await supabase
     .from("coa_jobs")
-    .select("status, execution_started_at, execution_completed_at, execution_duration_seconds, error_message, accounts_to_rename, accounts_to_create, accounts_to_delete, accounts_flagged, manual_cleanup_items")
+    .select("status, execution_started_at, execution_completed_at, execution_duration_seconds, error_message, accounts_to_rename, accounts_to_create, accounts_to_delete, accounts_flagged, manual_cleanup_items, merge_candidates")
     .eq("id", jobId)
     .single();
 
@@ -72,6 +72,7 @@ export async function GET(
     duration_seconds: job.execution_duration_seconds,
     error_message: job.error_message,
     manual_cleanup_items: (job as any).manual_cleanup_items || [],
+    merge_candidates: (job as any).merge_candidates || [],
     progress: {
       total: totalActions,
       completed: completedActions,
