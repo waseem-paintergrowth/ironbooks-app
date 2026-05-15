@@ -9,6 +9,7 @@ import { createServiceSupabase } from "./supabase";
 import * as qbo from "./qbo";
 import * as double from "./double";
 import * as validate from "./qbo-validation";
+import { generateManualRepairPlan, type FailureContext } from "./claude-repair";
 
 type SupabaseClient = ReturnType<typeof createServiceSupabase>;
 
@@ -164,6 +165,10 @@ export async function executeJob(jobId: string): Promise<{
   // Typically QBO platform limitations (account has transactions, system-protected, etc).
   // Different from `errors` which should ONLY contain unexpected failures.
   const manualCleanupItems: ManualCleanupItem[] = [];
+  // Failures collected during execution that we'll send to Claude at the END
+  // of the job to produce smart, plain-English manual cleanup line items.
+  // Each entry has the exact request body + QBO error + account snapshot.
+  const pendingFailures: FailureContext[] = [];
   const stats: ExecutionStats = {
     created: 0, renamed: 0, reclassified: 0, inactivated: 0, duration_seconds: 0,
   };
@@ -442,8 +447,18 @@ export async function executeJob(jobId: string): Promise<{
               { name: parentName, id: created.Id, type: accountType, subtype: accountSubType });
             stats.created++;
           } catch (e: any) {
-            errors.push(`Auto-create missing parent "${parentName}" failed: ${e.message}`);
-            await logProgress(ctx, "error", `Failed missing parent: ${parentName}`, { error: e.message });
+            // Don't push to `errors`. Send to Claude at end-of-job for a manual repair plan.
+            pendingFailures.push({
+              intended_action: "create",
+              account_id: null,
+              account_name: parentName,
+              request_body: { Name: parentName, AccountType: accountType, AccountSubType: accountSubType },
+              qbo_error: String(e?.message || e),
+              account_snapshot: null,
+            });
+            await logProgress(ctx, "warning",
+              `Parent "${parentName}" routed to manual cleanup`,
+              { reason: "QBO rejected parent create; sending to AI for repair plan" });
           }
         }
         await logProgress(ctx, "stage_complete", `Missing parents created`, { stage: "create_missing_parents" });
@@ -500,9 +515,30 @@ export async function executeJob(jobId: string): Promise<{
             { name: created.Name, parent: action.new_parent_name, id: created.Id });
           stats.created++;
         } catch (e: any) {
-          errors.push(`Create child "${action.new_name}" failed: ${e.message}`);
-          await markActionFailed(ctx, action.id, e.message);
-          await logProgress(ctx, "error", `Failed: ${action.new_name}`, { error: e.message });
+          // Don't push to `errors`. Collect for Claude to write a manual cleanup item.
+          pendingFailures.push({
+            intended_action: "create",
+            account_id: null,
+            account_name: action.new_name || "Unknown",
+            request_body: {
+              Name: action.new_name,
+              AccountType: action.new_type,
+              AccountSubType: action.new_subtype,
+              ParentRef: action.new_parent_name ? { value: "?", name: action.new_parent_name } : undefined,
+            },
+            qbo_error: String(e?.message || e),
+            account_snapshot: null,
+          });
+          await ctx.supabase
+            .from("coa_actions")
+            .update({
+              executed: false,
+              error_message: null,
+              flagged_reason: "Manual cleanup required: see Manual Cleanup Report.",
+            })
+            .eq("id", action.id);
+          await logActionResult(ctx, action.id, "manual_cleanup_required",
+            { name: action.new_name, reason: "QBO rejected create — sent to AI for repair plan" });
         }
       }
       await logProgress(ctx, "stage_complete", `Children created`, { stage: "create_children" });
@@ -544,28 +580,42 @@ export async function executeJob(jobId: string): Promise<{
           stats.renamed++;
         } catch (e: any) {
           if (isQboLimitationError(e)) {
-            manualCleanupItems.push({
+            // Collect for Claude to write a manual cleanup item with rich context
+            const currentSnapshot = accountMap.get(action.qbo_account_id!) as any;
+            pendingFailures.push({
+              intended_action: "rename",
               account_id: action.qbo_account_id ?? null,
               account_name: action.current_name || "Unknown account",
-              intended_action: "rename",
-              reason:
-                `Cannot rename to "${action.new_name}" via API — QBO rejected the change. This usually means the new name conflicts with an existing account, the type/subtype combo isn't valid for this account, or the parent account has restrictions.`,
-              suggestion:
-                `Open QBO → Chart of Accounts → find "${action.current_name}". Rename manually in the UI. If the name already exists, decide whether to merge the two accounts.`,
-              qbo_response: e.message,
+              request_body: {
+                Id: action.qbo_account_id,
+                Name: action.new_name,
+                AccountType: currentSnapshot?.AccountType,
+                AccountSubType: currentSnapshot?.AccountSubType,
+                SubAccount: currentSnapshot?.SubAccount,
+                ParentRef: currentSnapshot?.ParentRef,
+              },
+              qbo_error: String(e?.message || e),
+              account_snapshot: currentSnapshot ? {
+                Name: currentSnapshot.Name,
+                AccountType: currentSnapshot.AccountType,
+                AccountSubType: currentSnapshot.AccountSubType,
+                SubAccount: currentSnapshot.SubAccount,
+                ParentRef: currentSnapshot.ParentRef,
+                CurrentBalance: currentSnapshot.CurrentBalance,
+                Active: currentSnapshot.Active,
+              } : null,
             });
             await ctx.supabase
               .from("coa_actions")
               .update({
                 executed: false,
                 error_message: null,
-                flagged_reason:
-                  "Manual cleanup required: QBO rejected this rename. See Manual Cleanup Report.",
+                flagged_reason: "Manual cleanup required: see Manual Cleanup Report.",
               })
               .eq("id", action.id);
             await logActionResult(ctx, action.id, "manual_cleanup_required", {
               name: action.current_name,
-              reason: "QBO rejected rename (likely name conflict or type restriction)",
+              reason: "QBO rejected rename — sent to AI for repair plan",
             });
           } else {
             errors.push(`Rename "${action.current_name}" failed: ${e.message}`);
@@ -604,29 +654,43 @@ export async function executeJob(jobId: string): Promise<{
         } catch (e: any) {
           if (isQboLimitationError(e)) {
             // QBO platform limit (most often: account has historical transactions
-            // or non-zero balance). NOT an error — route to manual cleanup report.
-            manualCleanupItems.push({
+            // or non-zero balance). NOT an error — collect for Claude repair plan.
+            const snap = current as any;
+            pendingFailures.push({
+              intended_action: "inactivate",
               account_id: action.qbo_account_id ?? null,
               account_name: action.current_name || "Unknown account",
-              intended_action: "inactivate",
-              reason:
-                "Cannot inactivate via API — this account has activity (transactions, balance, or sub-accounts) that QBO won't let us remove programmatically.",
-              suggestion:
-                "Open QBO → Chart of Accounts → find this account. Either (1) reclassify its transactions to another account and zero out the balance, then mark it inactive in the QBO UI, or (2) leave it active if it's still needed.",
-              qbo_response: e.message,
+              request_body: {
+                Id: action.qbo_account_id,
+                Active: false,
+                AccountType: snap?.AccountType,
+                AccountSubType: snap?.AccountSubType,
+                SubAccount: snap?.SubAccount,
+                ParentRef: snap?.ParentRef,
+              },
+              qbo_error: String(e?.message || e),
+              account_snapshot: snap ? {
+                Name: snap.Name,
+                AccountType: snap.AccountType,
+                AccountSubType: snap.AccountSubType,
+                SubAccount: snap.SubAccount,
+                ParentRef: snap.ParentRef,
+                CurrentBalance: snap.CurrentBalance,
+                CurrentBalanceWithSubAccounts: snap.CurrentBalanceWithSubAccounts,
+                Active: snap.Active,
+              } : null,
             });
             await ctx.supabase
               .from("coa_actions")
               .update({
                 executed: false,
                 error_message: null,
-                flagged_reason:
-                  "Manual cleanup required: account has activity. See Manual Cleanup Report.",
+                flagged_reason: "Manual cleanup required: see Manual Cleanup Report.",
               })
               .eq("id", action.id);
             await logActionResult(ctx, action.id, "manual_cleanup_required", {
               name: action.current_name,
-              reason: "QBO blocks API inactivation (likely has transactions)",
+              reason: "QBO blocks API inactivation — sent to AI for repair plan",
             });
           } else {
             errors.push(`Inactivate "${action.current_name}" failed: ${e.message}`);
@@ -656,6 +720,22 @@ export async function executeJob(jobId: string): Promise<{
     }
 
     stats.duration_seconds = Math.floor((Date.now() - startTime) / 1000);
+
+    // STAGE 6: Generate AI-powered manual cleanup line items for any failures.
+    // Sends the full batch of failures to Claude in one call. Claude returns
+    // structured plain-English repair items appended to manualCleanupItems.
+    // On failure (rate limit, network, etc), the function returns a pass-through
+    // fallback so the job still completes cleanly.
+    if (pendingFailures.length > 0) {
+      await logProgress(ctx, "stage_start",
+        `Asking AI to generate ${pendingFailures.length} manual repair instructions`,
+        { stage: "ai_repair_plan", total: pendingFailures.length });
+      const aiItems = await generateManualRepairPlan(pendingFailures);
+      for (const it of aiItems) manualCleanupItems.push(it);
+      await logProgress(ctx, "stage_complete",
+        `AI generated ${aiItems.length} manual cleanup items`,
+        { stage: "ai_repair_plan", produced: aiItems.length });
+    }
 
     await supabase.from("coa_jobs").update({
       status: "complete",
